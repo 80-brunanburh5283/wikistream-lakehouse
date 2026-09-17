@@ -28,6 +28,11 @@ TOPIC          := $${WS_KAFKA_TOPIC:-wiki.recentchange}
 PRODUCER_SECONDS ?= 60
 PRODUCER_EVENTS  ?= 2000
 
+# Extra arguments for the test targets, e.g. PYTEST_ARGS="-k bronze -x". Passed as a
+# variable rather than as trailing make goals because make parses a bare `-k` as its
+# own keep-going flag, and `make test -- -k bronze` looks for a target named `-k`.
+PYTEST_ARGS ?=
+
 # Sampling window for the source-lag measurement. Not named SECONDS: that is a
 # bash builtin holding the shell's own uptime, and a recipe reading it gets 0.
 LAG_SECONDS ?= 120
@@ -246,23 +251,23 @@ typecheck: ## mypy
 
 .PHONY: test
 test: ## Unit + Spark + integration tests
-	$(UV) run pytest -m "unit or spark or integration"
+	$(UV) run pytest -m "unit or spark or integration" $(PYTEST_ARGS)
 
 .PHONY: test-unit
 test-unit: ## Unit tests only. No network, no Docker, no JVM.
-	$(UV) run pytest -m unit
+	$(UV) run pytest -m unit $(PYTEST_ARGS)
 
 .PHONY: test-spark
 test-spark: ## Schema tests against a real in-process Spark. Needs a JDK, not Docker.
-	$(UV) run pytest -m spark
+	$(UV) run pytest -m spark $(PYTEST_ARGS)
 
 .PHONY: test-integration
-test-integration: ## Integration tests. Needs `make up-core`.
-	$(UV) run pytest -m integration
+test-integration: ## Integration tests. Needs `make up-core`. PYTEST_ARGS="-k bronze" to narrow.
+	$(UV) run pytest -m integration $(PYTEST_ARGS)
 
 .PHONY: test-e2e
 test-e2e: ## The restart-idempotency proof. Needs `make up` and takes minutes.
-	$(UV) run pytest -m e2e -s
+	$(UV) run pytest -m e2e -s $(PYTEST_ARGS)
 
 .PHONY: coverage
 coverage: ## Unit test coverage report for src/wikistream
