@@ -93,8 +93,11 @@ class Settings(BaseSettings):
     #: Visible knob, not a default: 30s trades end-to-end latency for fewer,
     #: larger Iceberg data files. See docs/correctness.md on small files.
     trigger_interval_seconds: int = Field(default=30, ge=1)
-    #: Justified by the measured lateness distribution in docs/latency.md, not
-    #: picked for roundness.
+    #: Measured source lag is sub-second (p99 1.32s over 7,234 events; see
+    #: docs/latency.md). Ten minutes is ~450x that on purpose: the watermark is
+    #: sized for restart replay, where Kafka hands back a backlog of event times
+    #: as old as the outage, not for steady-state network jitter. A watermark
+    #: sized for the p99 would silently drop most of what a restart reads.
     watermark_minutes: int = Field(default=10, ge=1)
     spark_master: str = Field(default="local[*]")
     spark_driver_memory: str = Field(default="2g")
