@@ -21,10 +21,8 @@ dependencies = [
   "confluent-kafka>=2.15.1,<2.16",
   "pydantic>=2.12.0,<3",
   "pydantic-settings>=2.15.0,<3",
-  # Must match the Spark version in docker-compose.yml exactly; a driver/cluster
-  # mismatch fails at job submission with an opaque py4j error.
-  "pyspark==4.0.4",
-  # Only for the Jetstream fallback source.
+  # Only for the Jetstream fallback source. Small enough to keep in the runtime
+  # set rather than behind a switch nobody would remember to flip.
   "websockets>=17.1,<18",
 ]
 
@@ -41,6 +39,14 @@ dev = [
   "sqlfluff>=4.3.0,<5",
   "pre-commit>=4.4.0,<5",
 ]
+# Spark is a group, not a runtime dependency, for two reasons. The Spark
+# container already ships pyspark and installing a second copy invites a
+# driver/cluster version clash that surfaces as an opaque py4j error; and the
+# producer image — the only image built from this project — never imports it, so
+# putting it in `dependencies` would add ~400 MB of jars to a service that sends
+# JSON to Kafka. The pin must still match the Spark image tag in
+# docker-compose.yml exactly, because `make test-spark` runs against this copy.
+spark = ["pyspark==4.0.4"]
 # dbt and the Trino client. Kept in a group because the transform layer runs in
 # its own container and does not belong in the streaming runtime's dependency set.
 analytics = [
@@ -66,7 +72,7 @@ build-backend = "hatchling.build"
 packages = ["src/wikistream", "src/wikistream_dagster"]
 
 [tool.uv]
-default-groups = ["dev", "analytics", "orchestration"]
+default-groups = ["dev", "spark", "analytics", "orchestration"]
 
 # ----------------------------------------------------------------------------
 # Lint and format
@@ -111,6 +117,9 @@ ignore = [
 # Tests document themselves through their names; scripts are CLIs and print.
 "tests/**" = ["D", "ANN", "ARG", "S101"]
 "scripts/**" = ["T20", "D103"]
+# A container HEALTHCHECK command. Its stdout is what `docker inspect` shows for
+# an unhealthy container, so printing is the interface, not a leftover debug line.
+"src/wikistream/producer/healthcheck.py" = ["T20"]
 "src/wikistream_dagster/**" = ["D103"]
 
 [tool.ruff.lint.pydocstyle]
@@ -143,6 +152,10 @@ disallow_untyped_defs = false
 [tool.pytest.ini_options]
 minversion = "9.0"
 testpaths = ["tests"]
+# So `from doubles import ...` works from any test module. pytest would put
+# `tests/` on sys.path anyway as a side effect of importing the root conftest;
+# saying it here makes the import legible instead of accidental.
+pythonpath = ["tests"]
 addopts = "--strict-markers --strict-config -ra"
 markers = [
   "unit: pure-Python tests. No network, no Docker, no JVM. Must stay under a second each.",
