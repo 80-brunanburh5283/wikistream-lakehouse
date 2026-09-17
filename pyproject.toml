@@ -101,6 +101,10 @@ ignore = [
   "D203",  # conflicts with D211
   "D213",  # conflicts with D212
   "ANN401", # Any is sometimes correct (JSON payloads)
+  # `from pyspark.sql import functions as F` is the convention in every Spark
+  # codebase and every page of Spark's own documentation. Renaming it to satisfy
+  # the linter would make this repo read as unfamiliar to its intended audience.
+  "N812",
 ]
 
 [tool.ruff.lint.per-file-ignores]
@@ -142,6 +146,7 @@ testpaths = ["tests"]
 addopts = "--strict-markers --strict-config -ra"
 markers = [
   "unit: pure-Python tests. No network, no Docker, no JVM. Must stay under a second each.",
+  "spark: needs a JDK but no Docker. Starts an in-process Spark session, so seconds not milliseconds.",
   "integration: needs the core compose profile running. Skipped when it is not.",
   "e2e: the restart-idempotency proof. Needs the full stack and takes minutes.",
 ]

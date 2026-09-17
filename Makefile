@@ -183,12 +183,16 @@ typecheck: ## mypy
 	$(UV) run mypy
 
 .PHONY: test
-test: ## Unit + integration tests
-	$(UV) run pytest -m "unit or integration"
+test: ## Unit + Spark + integration tests
+	$(UV) run pytest -m "unit or spark or integration"
 
 .PHONY: test-unit
-test-unit: ## Unit tests only. No network, no Docker.
+test-unit: ## Unit tests only. No network, no Docker, no JVM.
 	$(UV) run pytest -m unit
+
+.PHONY: test-spark
+test-spark: ## Schema tests against a real in-process Spark. Needs a JDK, not Docker.
+	$(UV) run pytest -m spark
 
 .PHONY: test-integration
 test-integration: ## Integration tests. Needs `make up-core`.
