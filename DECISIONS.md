@@ -81,8 +81,11 @@ schema variation between event types, real bursts.
 The correctness work becomes the point of the repository rather than a footnote:
 if the source can redeliver, the sink must be idempotent, and that has to be
 proven rather than asserted. It also means the project cannot be demonstrated
-offline — so the test suite runs against captured fixtures and only one target
-(`make smoke-live`) touches the network.
+offline. The unit, `spark` and `integration` suites therefore run against captured
+fixtures, and exactly two targets reach the public internet: `make smoke-live`,
+which is a connectivity check, and `make test-e2e`, the restart proof — which
+feeds itself from the live endpoint because a crash-recovery proof run on hand-fed
+frames would mostly be a proof about the frames.
 
 The scope excluded by this choice is recorded plainly: no ML layer, no frontend,
 no second cloud implementation. See the README's limitations section.
@@ -1196,3 +1199,57 @@ Iceberg's own 24-hour floor on `older_than` stays in place, so the procedure can
 demonstrated deleting a file in a test that runs in seconds: the orphans it would remove
 have to be a day old. The integration test therefore asserts that the call succeeds and
 removes nothing, which is the assertion that would have caught this failure.
+
+---
+
+## ADR-0025 — Make the crash window deterministic by deleting `commits/N`
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+`silver.edits` claims one row per source event across restarts. The failure that
+claim exists to survive is narrow: Spark writes a micro-batch's Kafka offsets to
+`<checkpoint>/offsets/N` *before* running the batch and `<checkpoint>/commits/N`
+*after* it. A crash between those two writes leaves rows already merged into
+Iceberg and offsets Spark believes it never consumed, so on restart it re-reads
+that exact range and applies it a second time. That window is milliseconds wide.
+
+A test that tries to land a SIGKILL inside it is a coin flip. It would pass most
+of the time by killing the job somewhere harmless, and the green tick would mean
+nothing.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| SIGKILL the job and hope the timing lands mid-commit | Passes for the wrong reason almost every time. The assertion holds trivially when no batch was in flight, and nothing in the output distinguishes the two cases. |
+| Inject a fault into the job — a flag that raises after the MERGE, before the commit | Test-only code in the production path, and it proves the fault injector works rather than that the recovery works. |
+| Mock the checkpoint layer entirely | Then the subject is a mock of Spark's contract, not Spark's behaviour. The whole point is that this contract is Spark's, not mine. |
+| SIGKILL for real, then delete `commits/N` | Chosen. |
+
+### Decision
+
+`tests/e2e/test_restart_idempotency.py` kills both processes with SIGKILL while
+they are working, and then deletes the newest commit file. Deleting `commits/N`
+puts the checkpoint in exactly the state an interrupted commit leaves it in —
+`offsets/N` present, `commits/N` absent — so the replay is guaranteed rather than
+hoped for. The test prints how many Kafka records the replayed batch covered, which
+is the number that makes the result meaningful: 858 on the run recorded in
+`docs/correctness.md`.
+
+The sharpest assertion is the second replay. With the producer stopped and the
+topic static, re-running a committed batch of 2,640 records must move the row count
+by exactly zero — an equality, not a bound.
+
+### Consequence
+
+The proof is deterministic, and the two halves of it are honest about what each
+one does: SIGKILL demonstrates that a hard kill cannot half-write an Iceberg
+commit, and the file deletion demonstrates that a genuine re-read of already-merged
+offsets inserts nothing. Neither claims to be the other.
+
+The cost is that the test reaches into Spark's checkpoint layout, which is internal.
+If Spark renames those directories the test breaks — loudly, at the `rm`, not
+silently. `_numeric_entries` and `_batch_end_offsets` are commented with the layout
+they assume for that reason.

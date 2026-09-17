@@ -270,7 +270,7 @@ test-integration: ## Integration tests. Needs `make up-core`. PYTEST_ARGS="-k br
 	$(UV) run pytest -m integration $(PYTEST_ARGS)
 
 .PHONY: test-e2e
-test-e2e: ## The restart-idempotency proof. Needs `make up` and takes minutes.
+test-e2e: ## The restart-idempotency proof. Needs `make up`, the internet, and minutes.
 	$(UV) run pytest -m e2e -s $(PYTEST_ARGS)
 
 .PHONY: coverage
@@ -278,5 +278,5 @@ coverage: ## Unit test coverage report for src/wikistream
 	$(UV) run pytest -m unit --cov --cov-report=term-missing
 
 .PHONY: smoke-live
-smoke-live: ## The only target that touches the public internet
+smoke-live: ## Check the live source is reachable. Touches the public internet.
 	$(UV) run python scripts/smoke_live.py

@@ -36,19 +36,22 @@ make up                     # ~4 minutes cold
 
 ## Running the tests
 
-There are three levels, and they have different requirements:
+There are four levels, and they have different requirements:
 
 | Command | Needs | Roughly |
 |---|---|---|
 | `make test-unit` | nothing — no network, no Docker, no JVM | seconds |
+| `make test-spark` | a JDK, but no Docker | a minute |
 | `make test-integration` | `make up-core` | a minute |
-| `make test-e2e` | `make up` | several minutes |
+| `make test-e2e` | `make up`, plus the public internet | several minutes |
 
 Unit tests must stay offline and fast. If a test needs Kafka, MinIO or Spark, it
 is an integration test and belongs behind the `integration` marker so that
 someone without Docker running can still get a useful signal from `pytest`.
 
-`make smoke-live` is the only target that talks to the public internet.
+Two targets talk to the public internet, and only these two: `make smoke-live`,
+which checks the source is reachable, and `make test-e2e`, which feeds its scratch
+topic from the live stream. Everything else runs against captured fixtures.
 
 ## Before you open a pull request
 
