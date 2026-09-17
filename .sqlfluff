@@ -36,12 +36,28 @@ aliasing = explicit
 # dbt's ref() and source() are resolved by dbt, not by sqlfluff. Rendering them
 # as bare strings lets sqlfluff parse the model without a dbt connection, which
 # keeps lint runnable in CI without bringing Trino up.
+#
+# `this` is a context value rather than a macro on purpose: models write `{{ this }}`
+# with no parentheses, and a Jinja macro referenced without calling it renders as
+# the macro object, which is not valid SQL and fails the parse in a way that reads
+# like a syntax error in the model.
 [sqlfluff:templater:jinja:context]
 target = {"name": "ci", "schema": "gold"}
+this = gold.this_model
 
 [sqlfluff:templater:jinja:macros]
-ref = {% macro ref(model_name) %}silver.{{ model_name }}{% endmacro %}
+ref = {% macro ref(model_name) %}gold.{{ model_name }}{% endmacro %}
 source = {% macro source(source_name, table_name) %}{{ source_name }}.{{ table_name }}{% endmacro %}
-config = {% macro config() %}{% endmacro %}
-is_incremental = {% macro is_incremental() %}false{% endmacro %}
-this = {% macro this() %}gold.this_model{% endmacro %}
+# `{% set _ = kwargs %}` is what makes this a catch-all. A Jinja macro only accepts
+# unexpected keyword arguments if its body references `kwargs`, and every real call
+# is `{{ config(materialized=..., unique_key=...) }}` — without this line each one
+# raises "macro 'config' takes no keyword argument".
+config = {% macro config() %}{% set _ = kwargs %}{% set _ = varargs %}{% endmacro %}
+# Returns the string "true", which is truthy, so `{% if is_incremental() %}` blocks
+# are linted rather than skipped. That is the point: the incremental branch contains
+# the trickiest SQL in the project and is the half a `false` stub would never check.
+is_incremental = {% macro is_incremental() %}true{% endmacro %}
+# The project's own macro, restated because sqlfluff does not read dbt/macros. It
+# has to render to the same literal, or lint would be checking different SQL from
+# the SQL dbt runs — see dbt/macros/epoch_utc.sql.
+epoch_utc = {% macro epoch_utc() %}timestamp '1970-01-01 00:00:00 utc'{% endmacro %}

@@ -43,7 +43,9 @@ repos:
       - id: sqlfluff-lint
         # dbt models are Jinja templates; linting them without a compiled target
         # needs the templater configured in .sqlfluff, which is set to jinja.
-        files: ^(dbt/models|scripts)/.*\.sql$
+        # Tests and macros are in scope too: the singular tests contain the
+        # trickiest joins in the project, and an unlinted test is one nobody reads.
+        files: ^(dbt/(models|tests|macros)|scripts)/.*\.sql$
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.30.1
