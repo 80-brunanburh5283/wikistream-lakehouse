@@ -203,6 +203,47 @@ def write_bronze(
     return writer.toTable(target)
 
 
+def last_batch_summary(query: StreamingQuery) -> dict[str, object]:
+    """What the most recent micro-batch did, from the sink's metrics rather than the source's.
+
+    The row count comes from `sink.numOutputRows` on purpose. The obvious field,
+    `numInputRows`, is wrong when the sink is Iceberg: it reports exactly twice the
+    number of records the batch actually read. Measured on 2026-09-17 against this
+    pipeline, one batch at a time:
+
+    | sink                                | Kafka offset delta | numInputRows | sink.numOutputRows |
+    |-------------------------------------|-------------------:|-------------:|-------------------:|
+    | `noop`                              |              5,392 |        5,392 |              5,392 |
+    | `iceberg`                           |              3,138 |        6,276 |              3,138 |
+    | `iceberg`, `distribution-mode=none` |              7,727 |        7,727 |              7,727 |
+
+    So the doubling is not the Kafka source and not the plan — the same plan
+    measures correctly into a `noop` sink — it follows the exchange that Iceberg's
+    default distribution mode inserts before the write. `sink.numOutputRows` agrees
+    with both the Kafka offset delta and the `added-records` in the resulting
+    Iceberg snapshot, which is why it is the number reported here.
+
+    The write keeps the default distribution mode regardless. Changing a write
+    option to correct a metric would be tuning the instrument.
+    """
+    progress = query.lastProgress
+    if progress is None:
+        return {"batch_id": None, "rows": None}
+
+    sources = progress.get("sources") or [{}]
+    return {
+        "batch_id": progress.get("batchId"),
+        "rows": (progress.get("sink") or {}).get("numOutputRows"),
+        "batch_ms": progress.get("batchDuration"),
+        "end_offsets": sources[0].get("endOffset"),
+        # Zero means the batch drained everything Kafka had at planning time. A
+        # number that keeps climbing across batches is the signal that this laptop
+        # cannot keep up with the source, which is the one operational failure this
+        # pipeline can have while looking perfectly healthy.
+        "max_offsets_behind": (sources[0].get("metrics") or {}).get("maxOffsetsBehindLatest"),
+    }
+
+
 def run(once: bool = False, topic: str | None = None, table: str | None = None) -> int:
     """Start the stream and block until it stops."""
     settings = get_settings()
@@ -224,14 +265,7 @@ def run(once: bool = False, topic: str | None = None, table: str | None = None) 
     )
 
     query.awaitTermination()
-    progress = query.lastProgress
-    log.info(
-        "bronze stream stopped",
-        extra={
-            "batches": progress.get("batchId") if progress else None,
-            "rows_last_batch": progress.get("numInputRows") if progress else None,
-        },
-    )
+    log.info("bronze stream stopped", extra=last_batch_summary(query))
     return 0
 
 
