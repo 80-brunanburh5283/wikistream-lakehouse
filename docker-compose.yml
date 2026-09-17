@@ -1,0 +1,234 @@
+#  The whole stack. Three tiers, of which only two are profiles.
+#
+#    (no profile)  Kafka, MinIO, the Iceberg REST catalog, Spark. The core, and
+#                  the reason there is no `core` profile: these services are
+#                  always enabled, so `docker compose up` starts exactly them,
+#                  and a profile that can never be turned off is a longer way of
+#                  writing no profile at all. `make up-core` is this tier.
+#    full          adds Trino, dbt and Dagster. `make up`.
+#    producer      the ingester. Kept out of the always-on tier so that a bounded
+#                  test run and a long-lived ingest are never both writing to the
+#                  topic without someone having asked for that. `make ingest`.
+#
+#  Three conventions worth knowing before reading further:
+#
+#  1. Every service another one waits on has a healthcheck, and every dependency
+#     is `service_healthy`, never `service_started`. Kafka accepts a TCP
+#     connection several seconds before it will answer a metadata request, so
+#     `service_started` buys a producer that dies on its first send.
+#  2. Host-facing ports come from ${WS_*} with the same defaults as
+#     `.env.example`, so remapping a clashing port is a one-line edit to `.env`
+#     and nothing here needs to change.
+#  3. Every image is pinned to an exact release, never `latest`. A stack whose
+#     behaviour depends on when you cloned it is not reproducible, and the whole
+#     claim of this repository is that it runs.
+
+name: wikistream
+
+# A firehose plus a JVM's stdout fills a disk quietly. Bound it everywhere.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  # ------------------------------------------------------------------- kafka
+  kafka:
+    image: apache/kafka:4.1.2
+    container_name: wikistream-kafka
+    logging: *logging
+    ports:
+      # Only the host listener is published. The internal one stays inside the
+      # compose network, where it is the only address other containers use.
+      - "${WS_KAFKA_PORT:-9092}:9092"
+    environment:
+      # KRaft: this single process is both the controller quorum and the only
+      # broker. No ZooKeeper — one fewer container, one fewer thing to explain,
+      # and the deployment mode Kafka 4.x is the first release to require.
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # Fixed rather than generated, so `make down && make up` finds the metadata
+      # log it left behind instead of refusing to start against a formatted dir
+      # that claims a different cluster.
+      CLUSTER_ID: 3hzJmveNTS2stE3FRLaCVg
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,HOST:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,HOST://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      # Two listeners, because a Kafka client discards the address it dialled and
+      # reconnects to whatever the broker advertises. A container that dials
+      # kafka:29092 must be told "kafka:29092"; a pytest process on the host that
+      # dials localhost:9092 must be told "localhost:9092". One listener cannot
+      # be both, and getting this wrong produces the classic symptom: metadata
+      # succeeds, every produce times out.
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,HOST://localhost:${WS_KAFKA_PORT:-9092}
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # Single broker: anything above 1 leaves every internal topic permanently
+      # under-replicated and blocks consumer group commits.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+      # No rebalance delay: with one consumer there is nothing to wait for, and
+      # the 3s default shows up as a puzzling pause on every job start.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # A typo in a topic name should fail loudly. With auto-creation on it
+      # instead succeeds, silently making a one-partition topic that behaves
+      # almost right, which is far more expensive to notice.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Applies only to topics created without an explicit count; ours are
+      # created by scripts/create_topics.sh, which is explicit about both.
+      KAFKA_NUM_PARTITIONS: ${WS_KAFKA_TOPIC_PARTITIONS:-3}
+      # 512 MB is comfortable for one broker at ~40 events/s. The image's default
+      # heap is sized for a server, and on a 12 GB laptop the difference decides
+      # whether Spark also gets to run.
+      KAFKA_HEAP_OPTS: "-Xmx512M -Xms512M"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # Deliberately the internal listener: `localhost` would break the moment
+      # someone sets WS_KAFKA_PORT, because the host listener advertises that
+      # port and there is nothing behind it inside the container.
+      test:
+        [
+          "CMD-SHELL",
+          "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list >/dev/null 2>&1",
+        ]
+      interval: 15s
+      timeout: 20s
+      retries: 10
+      start_period: 20s
+
+  # ------------------------------------------------------------ object store
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: wikistream-minio
+    logging: *logging
+    command: server /data --console-address ":9001"
+    ports:
+      - "${WS_MINIO_S3_PORT:-9000}:9000"
+      - "${WS_MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      # These are MinIO's own documented defaults for a container bound to
+      # loopback. They open one empty local bucket on this machine and are not
+      # reusable anywhere, which is why they can sit in a public repository —
+      # see SECURITY.md. Nothing in this project ever holds a real credential.
+      MINIO_ROOT_USER: ${WS_S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${WS_S3_SECRET_KEY:-minioadmin}
+      # No release check on start-up: the stack must work with no internet
+      # beyond the one connection to Wikimedia.
+      MINIO_UPDATE: "off"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  # Creates the bucket and exits 0. A one-shot rather than a line in some
+  # start-up script, so `docker compose ps` shows whether it succeeded and the
+  # catalog can depend on it with `service_completed_successfully`.
+  mc-init:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: wikistream-mc-init
+    logging: *logging
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      # MC_HOST_<alias> rather than `mc alias set`: it keeps the password out of
+      # the process list and out of the container's config file.
+      MC_HOST_local: "http://${WS_S3_ACCESS_KEY:-minioadmin}:${WS_S3_SECRET_KEY:-minioadmin}@minio:9000"
+    entrypoint: ["/bin/sh", "-c"]
+    # --ignore-existing makes this idempotent, which it has to be: it runs on
+    # every `make up`, including the ones where the volume already has data.
+    command: ['mc mb --ignore-existing "local/${WS_S3_BUCKET:-lakehouse}" && mc ls local']
+    restart: "no"
+
+  # ---------------------------------------------------------------- catalog
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.10.1
+    container_name: wikistream-iceberg-rest
+    logging: *logging
+    depends_on:
+      minio:
+        condition: service_healthy
+      mc-init:
+        condition: service_completed_successfully
+    ports:
+      - "${WS_ICEBERG_REST_PORT:-8181}:8181"
+    environment:
+      # CATALOG_-prefixed vars become Iceberg catalog properties: `_` is a dot
+      # and `__` is a hyphen. So CATALOG_S3_PATH__STYLE__ACCESS is
+      # `s3.path-style-access`.
+      CATALOG_WAREHOUSE: s3://${WS_S3_BUCKET:-lakehouse}/warehouse
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      # MinIO serves bucket-in-path, not bucket-as-subdomain. Without this the
+      # client resolves `lakehouse.minio` and fails with a DNS error that reads
+      # like a network problem.
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      # The fixture defaults to an in-memory SQLite catalog, which silently
+      # forgets every table on restart — and restart survival is the property
+      # this project exists to demonstrate. A file on a volume instead.
+      CATALOG_URI: jdbc:sqlite:file:/home/iceberg/catalog.db
+      CATALOG_JDBC_SCHEMA__VERSION: V1
+      AWS_ACCESS_KEY_ID: ${WS_S3_ACCESS_KEY:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${WS_S3_SECRET_KEY:-minioadmin}
+      # S3FileIO signs every request, so it needs a region even though MinIO
+      # does not care which one.
+      AWS_REGION: ${WS_S3_REGION:-us-east-1}
+    volumes:
+      # Mounted at the image's own home directory because that is the one path
+      # already owned by the `iceberg` user; a volume at a path the image does
+      # not contain arrives root-owned and the process cannot write its database.
+      - iceberg-catalog:/home/iceberg
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8181/v1/config?warehouse=s3://${WS_S3_BUCKET:-lakehouse}/warehouse"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # ----------------------------------------------------------------- ingest
+  producer:
+    build:
+      context: .
+      dockerfile: docker/producer.Dockerfile
+    image: wikistream/producer:local
+    container_name: wikistream-producer
+    profiles: ["producer"]
+    logging: *logging
+    depends_on:
+      kafka:
+        condition: service_healthy
+    env_file:
+      # Optional: a fresh clone has no `.env` and every default here works
+      # without one. Present so a developer's local overrides reach the
+      # container without being restated below.
+      - path: .env
+        required: false
+    environment:
+      # In-network addresses, overriding whatever `.env` says. `.env` is written
+      # for host processes; inside the compose network `localhost` is this
+      # container. Compose applies `environment` after `env_file`, so these win.
+      WS_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      WS_S3_ENDPOINT: http://minio:9000
+      WS_ICEBERG_REST_URI: http://iceberg-rest:8181
+    # Unbounded by default: `make producer-bounded` overrides the command with
+    # --duration/--max-events for tests and CI.
+    command: ["python", "-m", "wikistream.producer"]
+    # The source reconnects internally, so a restart here means the process
+    # itself died — a fatal HTTP status or an unhandled fault. Restart anyway,
+    # but the count in `docker compose ps` is then a real signal.
+    restart: unless-stopped
+    stop_grace_period: 20s
+
+volumes:
+  kafka-data:
+  minio-data:
+  iceberg-catalog:
