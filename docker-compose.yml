@@ -194,6 +194,74 @@ services:
       retries: 12
       start_period: 10s
 
+  # ------------------------------------------------------------------- spark
+  #
+  # One container, `local[*]` inside it. No separate master and workers: on a 12 GB
+  # laptop a standalone cluster costs a JVM per role to demonstrate a distribution
+  # this workload does not need, and every extra JVM is memory the streaming job
+  # cannot have. What matters here — Kafka offsets, Iceberg commits, checkpoint
+  # recovery — behaves identically in local mode.
+  #
+  # The command is `sleep infinity` because this service is a place to run
+  # `spark-submit` into, not a job. `make stream-bronze` execs into it. That keeps
+  # the streaming query's lifetime under the operator's control rather than tied to
+  # a container restart policy, which is what makes the restart test in Phase 4
+  # something you can actually perform.
+  spark:
+    build:
+      context: .
+      dockerfile: docker/spark.Dockerfile
+    image: wikistream/spark:local
+    container_name: wikistream-spark
+    logging: *logging
+    depends_on:
+      kafka:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+    ports:
+      # The Spark UI for whichever job is running. Not exposed for automation —
+      # exposed because "is the stream actually progressing" is a question the UI
+      # answers in one screen and the logs answer in twenty lines.
+      - "${WS_SPARK_UI_PORT:-4040}:4040"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      WS_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      WS_S3_ENDPOINT: http://minio:9000
+      WS_ICEBERG_REST_URI: http://iceberg-rest:8181
+      WS_CHECKPOINT_ROOT: /opt/spark/checkpoints
+      # S3FileIO reads these directly; the Iceberg catalog properties in
+      # session.py pass them through as well, so both paths agree.
+      AWS_ACCESS_KEY_ID: ${WS_S3_ACCESS_KEY:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${WS_S3_SECRET_KEY:-minioadmin}
+      AWS_REGION: ${WS_S3_REGION:-us-east-1}
+    volumes:
+      # Read-only source and scripts: this container runs the code, it does not
+      # own it. Mounted rather than baked so that editing a streaming job is a
+      # restart of one query instead of a rebuild of a 1.5 GB image.
+      - ./src:/opt/wikistream/src:ro
+      - ./scripts:/opt/wikistream/scripts:ro
+      # Checkpoints must outlive the container or restart recovery is untestable —
+      # which would make the central claim of this repository unverifiable.
+      - spark-checkpoints:/opt/spark/checkpoints
+    command: ["sleep", "infinity"]
+    healthcheck:
+      # Proves the JVM starts and can see the classes that matter. `spark-submit
+      # --version` would only prove the former, and a missing Iceberg jar is the
+      # failure this stack is most likely to have.
+      test:
+        - CMD-SHELL
+        - >-
+          ls /opt/spark/jars/iceberg-spark-runtime-4.0_2.13-*.jar
+          /opt/spark/jars/spark-sql-kafka-0-10_2.13-*.jar >/dev/null 2>&1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    stop_grace_period: 30s
+
   # ----------------------------------------------------------------- ingest
   producer:
     build:
@@ -232,3 +300,4 @@ volumes:
   kafka-data:
   minio-data:
   iceberg-catalog:
+  spark-checkpoints:
