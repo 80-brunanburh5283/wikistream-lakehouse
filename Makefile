@@ -176,6 +176,10 @@ maintain: ## Compact files, expire snapshots, rewrite manifests, remove orphans
 verify-no-duplicates: ## Exit non-zero if silver.edits contains any duplicate event_id
 	$(SPARK_SUBMIT) /opt/wikistream/scripts/verify_no_duplicates.py
 
+.PHONY: prove-schema-evolution
+prove-schema-evolution: ## Add, rename, widen and drop a column on a scratch table; check the cost
+	$(SPARK_SUBMIT) /opt/wikistream/scripts/prove_schema_evolution.py
+
 .PHONY: table-stats
 table-stats: ## Row counts and file statistics for bronze and silver
 	$(SPARK_SUBMIT) /opt/wikistream/scripts/table_stats.py
