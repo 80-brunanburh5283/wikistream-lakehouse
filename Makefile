@@ -290,6 +290,20 @@ fmt-check: ## Formatting check only
 typecheck: ## mypy
 	$(UV) run mypy
 
+.PHONY: dbt-parse
+dbt-parse: ## Compile the dbt graph without a warehouse. The SQL half of `make lint`.
+	@# Through uv rather than through the dbt container, because this is a lint and
+	@# not a run: it needs the project and the profile, not Trino. Every value in
+	@# dbt/profiles.yml is an env_var() with a default and the profile's auth method
+	@# is `none`, so it resolves with nothing configured — which is what lets CI run
+	@# it with no service up. The target path is outside the tree so a lint leaves
+	@# the working copy alone.
+	$(UV) run dbt parse \
+	  --project-dir dbt \
+	  --profiles-dir dbt \
+	  --target-path /tmp/wikistream-dbt-parse \
+	  --no-use-colors
+
 .PHONY: test
 test: ## Unit + Spark + integration tests
 	$(UV) run pytest -m "unit or spark or integration" $(PYTEST_ARGS)

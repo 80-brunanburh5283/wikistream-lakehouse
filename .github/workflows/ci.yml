@@ -1,0 +1,241 @@
+# Every check that runs on a push and on a pull request.
+#
+# Free tier only, and deliberately so: `ubuntu-latest`, the public images this
+# project already uses, and no credential of any kind. Every step shells out to a
+# `make` target rather than restating the command, because the property worth having
+# is that a green run here means the same command is green on a laptop. When a step
+# does something the Makefile does not, it says why.
+#
+# Two things are deliberately absent. Terraform and the Kubernetes manifests are in
+# infra.yml, which is path-filtered. And `make test-e2e` — the restart-idempotency
+# proof — is not here at all: it consumes the live Wikimedia stream, so an outage
+# upstream would paint an unrelated commit red, and it takes minutes. It is run by
+# hand, and README.md says so rather than implying CI covers it.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The only result anyone reads is the one for the newest commit on a branch, so a
+# second push cancels the run for the first. Grouped by ref and not by SHA, which
+# would never cancel anything.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read the code. Nothing else. No job comments on a pull request, publishes a
+# package or assumes a cloud role. Stated here rather than left to the repository
+# default, which is read-write on accounts created before 2023.
+permissions:
+  contents: read
+
+env:
+  # The version that resolved uv.lock. `uv sync --locked` fails rather than
+  # re-resolving, so a lock file edited by hand — or by a different uv — is a red
+  # build instead of a quiet difference between CI's environment and the committed
+  # one.
+  UV_VERSION: "0.12.15"
+  # The development interpreter. First-party code targets 3.10 because that is what
+  # the Spark image ships (DECISIONS.md ADR-0023) and ruff and mypy are configured
+  # for 3.10 — so running them under 3.12 is exactly what catches a 3.11+ idiom
+  # before it reaches a container.
+  PYTHON_VERSION: "3.12"
+  # The JDK in the Spark image. The `spark`-marked tests start an in-process Spark
+  # rather than a container, and a different major version here would mean they
+  # proved something about a runtime this project does not use.
+  JAVA_VERSION: "17"
+
+jobs:
+  lint:
+    name: lint, types and dbt parse
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          # Keyed on uv.lock by the action. The wheel that dominates this
+          # environment is pyspark at ~400 MB, and it moves about once a quarter.
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      - run: make lint
+      - run: make typecheck
+      # dbt's own parser is the only check here that reads the models the way dbt
+      # does: ruff does not know SQL, and sqlfluff runs with the jinja templater, so
+      # a `ref()` naming a model that does not exist is invisible to both. Needs no
+      # warehouse — see the target's comment.
+      - run: make dbt-parse
+
+  unit:
+    name: unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      # Not `make test-unit`: the same tests, plus coverage. The marker is what
+      # keeps this job honest about its dependencies — a `unit` test that reaches
+      # the network or Docker would pass here and be wrongly marked.
+      - name: pytest -m unit, with coverage
+        run: uv run pytest -m unit --cov --cov-report=term-missing --cov-report=xml
+
+      # The number goes in the run summary and in an artefact, both of which are
+      # dated and attached to a commit. No badge: a badge is a second copy of a
+      # number with nothing keeping it honest, and the repository would then be
+      # asserting something no command in it measures.
+      - name: coverage summary
+        run: |
+          uv run coverage report > coverage-summary.txt
+          {
+            echo '### Coverage — `src/wikistream`'
+            echo
+            uv run coverage report --format=markdown
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: coverage-${{ github.sha }}
+          path: |
+            coverage.xml
+            coverage-summary.txt
+          retention-days: 14
+
+  spark:
+    name: spark schema tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # A JDK, not Docker. These tests start Spark in-process to check that the
+      # table schemas in `wikistream.lakehouse.schema` are the schemas Spark
+      # actually creates, which is the one assertion no amount of pure-Python
+      # testing can make.
+      - uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      - run: make test-spark
+
+  integration:
+    name: integration (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # Split in two because the whole suite does not fit the budget. Measured on
+    # 2026-09-18: 22 tests, 10m12s, on a 12 GB WSL box that was also running the
+    # full stack. Adding the image build and four healthchecks to that puts one job
+    # at the wrong side of fifteen minutes, and a check nobody waits for is a check
+    # nobody reads.
+    #
+    # The split follows the cost, which is Spark start-ups rather than assertions:
+    # test_silver_rebuild.py alone is about seven of the ten minutes, because a MERGE
+    # test has to ingest to bronze first and then each rebuild is another submit.
+    # bronze and schema evolution together are about three.
+    timeout-minutes: 15
+    strategy:
+      # Both shards report. Cancelling the second because the first failed would
+      # hide whether the fault is in one area or in the stack they share.
+      fail-fast: false
+      matrix:
+        include:
+          - shard: bronze and schema evolution
+            paths: tests/integration/test_bronze.py tests/integration/test_schema_evolution.py
+          - shard: silver merge and rebuild
+            paths: tests/integration/test_silver_rebuild.py
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      # No `.env` is written. Every `${WS_*}` in docker-compose.yml carries a
+      # default, so the stack comes up with nothing configured, and that is the
+      # configuration a stranger who clones the repository gets — the one worth
+      # testing. `.env.example` documents the knobs for anyone who wants to move
+      # one.
+      #
+      # No Docker layer cache, on purpose, and both shards pay the build. The only
+      # image built here is the Spark one, and its cacheable part — the six Maven
+      # jars and a pip install, ~240 MB — sits on top of a 2.1 GB base image that a
+      # layer cache does not cover, because base layers come from the registry
+      # rather than from the build. So `type=gha` would move a quarter of a gigabyte
+      # in and out of the Actions cache to save one Maven fetch, while the download
+      # that actually costs the minutes stayed exactly as slow.
+      - name: bring up Kafka, MinIO, the Iceberg catalog and Spark
+        run: make up-core
+
+      # The marker still applies, so a test in one of these files that is not
+      # marked `integration` is not silently picked up by a shard that happens to
+      # name its file.
+      - name: pytest -m integration
+        run: make test-integration PYTEST_ARGS="${{ matrix.paths }}"
+
+      # Before the teardown, because `down` takes the logs with it. Only on
+      # failure: this is the output a maintainer needs to diagnose a red run without
+      # reproducing it, and it is noise on a green one.
+      - name: service logs
+        if: failure()
+        run: docker compose logs --tail=200
+
+      - name: tear down
+        if: always()
+        run: make down
+
+  secrets:
+    name: secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # The version pinned in .pre-commit-config.yaml, so the hook a contributor
+      # runs on commit and the scan that runs here find the same things.
+      GITLEAKS_VERSION: "8.30.1"
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # The whole history, because the claim being checked is that no commit has
+          # ever contained a credential. Deleting a secret in a later commit does
+          # not make the earlier one safe, and a shallow clone would agree that it
+          # did.
+          fetch-depth: 0
+
+      - name: install gitleaks ${{ env.GITLEAKS_VERSION }}
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin" gitleaks
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # The release binary rather than gitleaks-action, which asks organisations for
+      # a licence key and posts to the API — neither of which this needs. `--redact`
+      # so that a finding does not print the secret into a public log, which would
+      # turn one exposure into two.
+      - name: scan every commit
+        run: gitleaks git . --redact --no-banner

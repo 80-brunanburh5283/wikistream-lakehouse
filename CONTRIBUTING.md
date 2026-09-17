@@ -40,10 +40,17 @@ There are four levels, and they have different requirements:
 
 | Command | Needs | Roughly |
 |---|---|---|
-| `make test-unit` | nothing — no network, no Docker, no JVM | seconds |
-| `make test-spark` | a JDK, but no Docker | a minute |
-| `make test-integration` | `make up-core` | a minute |
+| `make test-unit` | nothing — no network, no Docker, no JVM | 262 tests, 11 s |
+| `make test-spark` | a JDK, but no Docker | 75 tests, 67 s |
+| `make test-integration` | `make up-core` | 22 tests, 10 min |
 | `make test-e2e` | `make up`, plus the public internet | several minutes |
+
+Those three figures were measured on one machine on 2026-09-18 and are there to set
+expectations, not as a benchmark. The integration suite is slow for one reason: most
+of its ten minutes is JVM start-up, because every assertion about a MERGE has to
+ingest to bronze with one `spark-submit` and then rebuild with another. CI runs it in
+two shards for that reason; `PYTEST_ARGS="tests/integration/test_bronze.py"` narrows
+it the same way locally.
 
 Unit tests must stay offline and fast. If a test needs Kafka, MinIO or Spark, it
 is an integration test and belongs behind the `integration` marker so that
@@ -66,11 +73,19 @@ Everything else runs against captured fixtures and local containers.
 ```bash
 make lint         # ruff check, ruff format --check, sqlfluff
 make typecheck    # mypy
-make test         # unit + integration
+make dbt-parse    # compiles the dbt graph; no warehouse needed
+make test         # unit + Spark + integration
 ```
 
 `uv run pre-commit run --all-files` runs the same checks the hooks run, plus
 secret scanning.
+
+These are the commands CI runs — `.github/workflows/ci.yml` calls the same targets
+rather than restating them, so a green run there means the same command is green
+here. What CI adds is a scan of every commit in the history for credentials and, in
+`infra.yml`, validation of the Terraform and the Kubernetes manifests. What it
+leaves out is `make test-e2e`, which depends on the live Wikimedia stream: an outage
+upstream would fail a pull request that had nothing to do with it.
 
 ## Commit messages
 
