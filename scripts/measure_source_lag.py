@@ -1,10 +1,11 @@
 #!/usr/bin/env python
-"""Measure how stale events are when they arrive, to justify the watermark.
+"""Measure how stale events are when they arrive, and how far the tail reaches.
 
-The watermark on the silver stream decides how long to wait for late events
-before finalising a window and dropping stragglers. Picking it by taste means
-either losing real data or holding state forever. This script measures the
-distribution the choice should be based on:
+This script was written to size a watermark and ended up being one of the two
+reasons there is not one — see `docs/latency.md` and ADR-0019. It still runs,
+because "how late is late here" is the question behind every design choice in the
+silver layer: the quarantine's future-timestamp rule, the `late_by_seconds`
+column, and how much history a `MERGE` has to look through.
 
     lag = (time this process received the event) - (event's own meta.dt)
 
@@ -14,8 +15,8 @@ cannot control is already inside it, which is what makes it the right input.
 
     uv run python scripts/measure_source_lag.py --seconds 120
 
-Writes a markdown table to stdout. The figures in `docs/latency.md`, and the
-`watermark_minutes` default, come from a run of this script.
+Writes a markdown table to stdout. Every figure in `docs/latency.md` comes from one
+run of this script.
 """
 
 from __future__ import annotations

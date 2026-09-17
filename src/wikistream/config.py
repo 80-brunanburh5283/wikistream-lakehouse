@@ -110,12 +110,11 @@ class Settings(BaseSettings):
     #: Visible knob, not a default: 30s trades end-to-end latency for fewer,
     #: larger Iceberg data files. See docs/correctness.md on small files.
     trigger_interval_seconds: int = Field(default=30, ge=1)
-    #: Measured source lag is sub-second (p99 1.32s over 7,234 events; see
-    #: docs/latency.md). Ten minutes is ~450x that on purpose: the watermark is
-    #: sized for restart replay, where Kafka hands back a backlog of event times
-    #: as old as the outage, not for steady-state network jitter. A watermark
-    #: sized for the p99 would silently drop most of what a restart reads.
-    watermark_minutes: int = Field(default=10, ge=1)
+    #: There is deliberately no watermark setting. The silver stream declares no
+    #: watermark at all — duplicate suppression is `MERGE INTO`'s job against the
+    #: table, so the dedup window is the table's whole history. ADR-0019 and
+    #: tests/spark/test_watermark_would_drop_data.py have the measurement that
+    #: killed the watermark: the operator that reads one drops a late row silently.
     spark_master: str = Field(default="local[*]")
     spark_driver_memory: str = Field(default="2g")
 

@@ -425,7 +425,12 @@ being off by 26 points is the more useful thing to record.
 
 ## ADR-0009 — A 10-minute watermark for a sub-second stream
 
-**Date:** 2026-09-17 · **Status:** accepted
+**Date:** 2026-09-17 · **Status:** superseded by [ADR-0019](#adr-0019--no-watermark-on-the-silver-stream)
+
+**Superseded because** the watermark was sized here before the silver writer existed.
+When it was built, the operator that would have read the watermark turned out to drop
+data silently, so the whole setting went. The lag measurement below is still the real
+one and still worth keeping; the conclusion drawn from it is not.
 
 ### Context
 
@@ -890,8 +895,10 @@ memory does not grow with uptime.
 
 Wikimedia's `recentchange` stream does not behave the way that design assumes. A
 wiki that loses its connection to the event bus reconnects and replays, and the
-replay can be tens of minutes behind. Measured source lag has a p99 of 4m12s
-(`docs/latency.md`), but the tail is not bounded by anything I control.
+replay can be tens of minutes behind. Steady-state source lag is sub-second — p99
+1.32 s over 7,234 events, `docs/latency.md` — but that distribution says nothing
+about the reconnect tail, which is not bounded by anything I control, and a
+watermark is a data-loss setting sized against exactly the part I cannot measure.
 
 ### Options considered
 

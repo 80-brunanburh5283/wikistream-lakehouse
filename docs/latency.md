@@ -1,7 +1,10 @@
-# Source lag, and where the watermark number comes from
+# Source lag, and the watermark this measurement talked me out of
 
-The silver stream carries a 10-minute watermark. This page is why, because a
-watermark chosen by taste is a data-loss setting chosen by taste.
+How stale is an event by the time this pipeline sees it? I measured it to size a
+watermark, and the answer plus one experiment is why the silver stream has no
+watermark at all. The measurement is still here because "how late is late" is the
+question behind the quarantine's future-timestamp rule, the `late_by_seconds`
+column, and how much history a `MERGE` has to look through.
 
 ## What was measured
 
@@ -17,9 +20,8 @@ lag = (local wall-clock time the event was received) - (the event's own meta.dt)
 
 That difference contains MediaWiki's internal propagation, Wikimedia's own Kafka
 hop, the EventStreams HTTP hop, and the network path to the measuring machine.
-None of those are things this pipeline controls, which is what makes the number
-the right input to the watermark rather than a measurement of the pipeline
-itself.
+None of those are things this pipeline controls, which is what makes it a
+measurement of the source rather than of the pipeline.
 
 ## Result
 
@@ -56,49 +58,64 @@ is right.
 
 The consequence is stated rather than papered over: **absolute lag values above
 are accurate to about ±1 second. The shape of the distribution is reliable; the
-last decimal place is not.** For choosing a watermark measured in minutes, that
-precision is far more than enough.
+last decimal place is not.** For deciding whether lateness is a matter of seconds
+or of minutes, that precision is far more than enough.
 
-## Why 10 minutes, when p99 is 1.32 seconds
+## The distribution above is not the one a watermark has to survive
 
-The watermark is roughly 450× the measured p99. That looks absurd until you ask
-what the watermark is actually protecting against, which is not steady-state
-network jitter.
+A watermark has to be sized against the worst arrival, not the typical one, and
+none of the events in that sample were the interesting case. The interesting cases
+are all recoveries:
 
-In steady state, lag is sub-second and a 30-second watermark would be generous.
-The watermark exists for the case where the pipeline has *not* been in steady
-state:
-
-- The Spark job is stopped and restarted. Kafka retains 24 hours, so on restart
-  the job reads a backlog whose event times are as old as the outage. With a
-  30-second watermark, every event older than 30 seconds past the newest one in
-  the batch is dropped as late — so a two-minute restart silently discards most
-  of what it reads. That is the failure mode the restart-idempotency test would
-  otherwise expose as missing rows.
-- The producer reconnects. One reconnect was observed during this 180-second
-  measurement run — roughly one per three minutes of streaming — and each
-  reconnect replays from `Last-Event-ID`, delivering events already seen and
-  events whose timestamps precede the newest already processed.
-- MediaWiki backfills. Some `categorize` events are emitted as a consequence of
+- **The Spark job is stopped and restarted.** Kafka retains 24 hours, so on restart
+  the job reads a backlog whose event times are as old as the outage. Against a
+  30-second watermark, everything more than 30 seconds behind the newest event in
+  the batch is late.
+- **The producer reconnects.** One reconnect was observed during this 180-second
+  measurement run — roughly one per three minutes of streaming — and each reconnect
+  replays from `Last-Event-ID`, so it delivers events already seen and events whose
+  timestamps precede the newest one already processed.
+- **MediaWiki backfills.** Some `categorize` events are emitted as a consequence of
   an earlier edit rather than at the moment of the change.
 
-So the watermark is sized for recovery, not for the network. Ten minutes covers a
-restart of up to ten minutes without losing data.
+So the number to size against is "how long might this pipeline have been down",
+which is 24 hours before Kafka's retention makes the question moot — not 1.32
+seconds. A watermark that covers 24 hours holds 24 hours of keys in state, which is
+the entire cost the watermark was supposed to avoid.
 
-## What it costs
+## What the watermark would have done to the late rows
 
-State retention is the price of a wide watermark. At the measured 40 events/second,
-ten minutes of watermark means Spark holds roughly
+Measured, not argued, in `tests/spark/test_watermark_would_drop_data.py`:
 
+```bash
+uv run pytest -m spark -k watermark
 ```
-40 events/s x 600 s = 24,000 events
-```
 
-of deduplication state. That is small enough to be uninteresting on a laptop,
-which is the honest reason the trade-off was easy to make here. On a stream two
-orders of magnitude larger the calculation would go the other way, and the right
-answer would be a tighter watermark plus explicit late-data handling into a
-correction table.
+Each design is given the same two events — one on time, one 30 minutes behind it —
+one micro-batch each, and the table below is what came out the far side.
+
+| design under a 10-minute watermark | the row 30 minutes late |
+|---|---|
+| `dropDuplicatesWithinWatermark("event_id")` | **silently dropped** |
+| `dropDuplicates("event_id")` | **silently dropped** |
+| no stateful operator at all | kept — a watermark changes nothing on its own |
+| no watermark, `MERGE INTO` against the table (the design in use) | kept |
+
+"Silently" is the operative word: no exception, no `_corrupt_record`, no quarantine
+row, no metric that names it. `numOutputRows` is simply one lower than
+`numInputRows`, and a reconnecting wiki's edits would be gone with nothing in the
+pipeline saying so.
+
+The cliff has a position, and the test pins that too: a row *five* minutes late comes
+through `dropDuplicatesWithinWatermark` untouched. The objection to the rejected
+design is where its edge falls, not that watermarks discard data indiscriminately.
+
+So the silver stream declares no watermark. Deduplication is the table's job —
+`MERGE INTO ... WHEN NOT MATCHED THEN INSERT` looks each key up in `silver.edits`
+itself, so the dedup window is the table's whole history and no arrival is too late
+to be recognised as a duplicate. ADR-0019 records the trade in full; the cost is
+that the `MERGE` reads the target table on every batch, so write amplification grows
+with table size instead of staying flat.
 
 ## Limitations of this measurement
 
@@ -109,7 +126,11 @@ correction table.
   including the 52% of events that are `categorize` rather than human edits.
 - The lag distribution says nothing about lag *inside* this pipeline. That is a
   separate number and is not claimed here.
+- It also says nothing about the reconnect tail, which is the case that decided the
+  design. No sample in this window was more than 2.74 s late, so the table above is
+  evidence about a mechanism, not about how often the mechanism matters here.
 
-Re-run the command at the top of this page to get current figures; nothing in the
-repository depends on the specific values above except this document and the
-watermark default in `src/wikistream/config.py`.
+Re-run the command at the top of this page to get current figures. Nothing in the
+repository reads the values above: no watermark setting exists any more, and the two
+places that used to cite one — `src/wikistream/config.py` and `.env.example` — now
+say why there is nothing to configure.
