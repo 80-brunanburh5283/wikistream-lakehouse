@@ -9,7 +9,7 @@ written by hand rather than captured.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -140,7 +140,7 @@ def test_partition_key_skew_is_real_and_measured(sample_events):
 
 def test_event_time_is_parsed_as_aware_utc(by_title):
     parsed = event_time(by_title["Adversarial:baseline"])
-    assert parsed == datetime(2026, 9, 17, 4, 0, 0, tzinfo=UTC)
+    assert parsed == datetime(2026, 9, 17, 4, 0, 0, tzinfo=timezone.utc)
     assert parsed.tzinfo is not None
 
 

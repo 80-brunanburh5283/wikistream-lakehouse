@@ -32,7 +32,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from wikistream.config import get_settings
@@ -181,7 +181,9 @@ def main(argv: list[str] | None = None) -> int:
     check_contract(decoded, report)
 
     lags = [
-        (datetime.now(UTC) - t).total_seconds() for t in map(event_time, decoded) if t is not None
+        (datetime.now(timezone.utc) - t).total_seconds()
+        for t in map(event_time, decoded)
+        if t is not None
     ]
     if lags:
         # Informational, not a check. One sample of twenty says nothing about the

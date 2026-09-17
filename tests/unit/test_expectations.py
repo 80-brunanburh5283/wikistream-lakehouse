@@ -9,7 +9,7 @@ mode this design has, which is one language being fixed and the other forgotten.
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -32,12 +32,12 @@ pytestmark = pytest.mark.unit
 #: `datetime.now()` here would make the future-tolerance test pass or fail depending
 #: on the fixture's age, which is the sort of test that goes red six months later
 #: for no reason anyone can reconstruct.
-NOW = datetime(2026, 9, 17, 4, 5, 0, tzinfo=UTC)
+NOW = datetime(2026, 9, 17, 4, 5, 0, tzinfo=timezone.utc)
 
 GOOD = Candidate(
     event_id="aaaaaaa1-0000-4000-8000-000000000001",
     raw_event_time="2026-09-17T04:00:00.000Z",
-    event_time=datetime(2026, 9, 17, 4, 0, 0, tzinfo=UTC),
+    event_time=datetime(2026, 9, 17, 4, 0, 0, tzinfo=timezone.utc),
     domain="en.wikipedia.org",
 )
 

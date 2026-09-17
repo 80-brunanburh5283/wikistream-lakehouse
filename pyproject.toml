@@ -79,7 +79,14 @@ default-groups = ["dev", "spark", "analytics", "orchestration"]
 # ----------------------------------------------------------------------------
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+# py310, not py312, and this is not a mistake. The Spark image ships Python 3.10.12
+# — the interpreter is the base image's, not ours — and every module under
+# `src/wikistream/streaming` is imported by `spark-submit` inside that container. A
+# 3.11+ idiom in shared code passes every local test on 3.12 and then fails at
+# import time in the container, which is where `datetime.UTC` cost an hour. Ruff at
+# this target refuses to suggest one (UP017 in particular), and mypy at the same
+# version refuses to accept one. See DECISIONS.md ADR-0023.
+target-version = "py310"
 extend-exclude = ["dbt/target", "dbt/dbt_packages"]
 
 [tool.ruff.lint]
@@ -129,7 +136,10 @@ convention = "google"
 # Types
 # ----------------------------------------------------------------------------
 [tool.mypy]
-python_version = "3.12"
+# The Spark container's interpreter, for the reason given under [tool.ruff]. Typeshed
+# gates `datetime.UTC` on `sys.version_info >= (3, 11)`, so this setting turns "works
+# here, ImportError there" into a type error at lint time.
+python_version = "3.10"
 files = ["src"]
 mypy_path = "src"
 explicit_package_bases = true

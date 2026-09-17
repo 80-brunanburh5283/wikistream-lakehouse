@@ -57,7 +57,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from wikistream import events
@@ -69,7 +69,7 @@ from wikistream import events
 #: now" on purpose: a relative floor would make a replay of last month's bronze
 #: quarantine rows that were valid when they arrived, which would make
 #: `make rebuild-silver` non-idempotent with respect to wall-clock time.
-EVENT_TIME_FLOOR = datetime(2001, 1, 15, tzinfo=UTC)
+EVENT_TIME_FLOOR = datetime(2001, 1, 15, tzinfo=timezone.utc)
 
 #: How far ahead of the reference time an `event_time` may be before it is treated
 #: as a clock fault. An hour is generous for a source whose measured p99 lag is

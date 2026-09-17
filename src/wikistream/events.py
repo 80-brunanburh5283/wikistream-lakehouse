@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 #: Fields without which a row cannot be processed at all, checked explicitly
@@ -114,7 +114,7 @@ def event_time(event: dict[str, Any]) -> datetime | None:
         parsed = datetime.fromisoformat(raw)
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def missing_required_fields(event: dict[str, Any]) -> tuple[str, ...]:

@@ -25,7 +25,7 @@ import statistics
 import sys
 import time
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from wikistream.config import get_settings
@@ -58,7 +58,7 @@ def _parse_event_time(event: dict[str, Any]) -> datetime | None:
         parsed = datetime.fromisoformat(raw)
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def measure(seconds: float, max_events: int) -> list[float]:
@@ -69,7 +69,7 @@ def measure(seconds: float, max_events: int) -> list[float]:
     deadline = time.monotonic() + seconds
 
     for event in source.iter_events():
-        received = datetime.now(UTC)
+        received = datetime.now(timezone.utc)
         event_time = _parse_event_time(event)
         if event_time is not None:
             lags.append((received - event_time).total_seconds())

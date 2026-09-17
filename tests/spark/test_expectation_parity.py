@@ -17,7 +17,7 @@ Spark's verdict.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import pytest
@@ -38,7 +38,7 @@ pytestmark = pytest.mark.spark
 #: rule is deterministic; written without a zone suffix and read under the session's
 #: UTC timezone, which is how every timestamp in this project is interpreted.
 REFERENCE_SQL = "2026-09-17 04:05:00"
-REFERENCE = datetime(2026, 9, 17, 4, 5, 0, tzinfo=UTC)
+REFERENCE = datetime(2026, 9, 17, 4, 5, 0, tzinfo=timezone.utc)
 
 
 def _frames(spark, payloads: list[str]):
