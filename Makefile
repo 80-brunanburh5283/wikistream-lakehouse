@@ -317,3 +317,33 @@ coverage: ## Unit test coverage report for src/wikistream
 .PHONY: smoke-live
 smoke-live: ## Check the live source is reachable. Touches the public internet.
 	$(UV) run python scripts/smoke_live.py
+
+# ------------------------------------------------------- infrastructure as code
+#
+#  Neither of these talks to AWS or to a cluster, and neither can: `init` runs with
+#  `-backend=false`, there is no provider credential anywhere in the repository, and
+#  `validate` reads nothing but the provider schema. `infra/aws/README.md` opens
+#  with a banner saying the module has never been applied. That is the whole point
+#  of it — see hard rule 2 of the project's own contributing guide.
+#
+#  The three binaries are not Python dependencies, so they are not in uv.lock. Each
+#  target says what to install if it is missing rather than failing with
+#  "command not found".
+
+TF_DIR ?= infra/aws
+
+.PHONY: infra-validate
+infra-validate: ## terraform fmt -check, init -backend=false, validate. No AWS calls.
+	@command -v terraform >/dev/null || { \
+	  echo "terraform not found. Unzip the release binary from"; \
+	  echo "https://releases.hashicorp.com/terraform/ into ~/.local/bin"; exit 1; }
+	terraform -chdir=$(TF_DIR) fmt -check -recursive
+	terraform -chdir=$(TF_DIR) init -backend=false -input=false
+	terraform -chdir=$(TF_DIR) validate
+
+.PHONY: infra-scan
+infra-scan: ## trivy config over the Terraform. Fails on any finding.
+	@command -v trivy >/dev/null || { \
+	  echo "trivy not found. Untar the release binary from"; \
+	  echo "https://github.com/aquasecurity/trivy/releases into ~/.local/bin"; exit 1; }
+	trivy config --quiet --exit-code 1 --disable-telemetry $(TF_DIR)

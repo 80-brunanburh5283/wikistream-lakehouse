@@ -40,9 +40,10 @@ dbt/dbt_packages/
 dbt/logs/
 dbt/.user.yml
 
-# Terraform
+# Terraform. `.terraform.lock.hcl` is deliberately NOT here: it pins the provider
+# to a checksum, so committing it is what makes `terraform init` reproducible.
+# `infra/aws` is a root module, and root modules commit their lock file.
 .terraform/
-.terraform.lock.hcl
 *.tfstate
 *.tfstate.*
 *.tfplan
