@@ -30,12 +30,18 @@ A file being written right now by a commit that has not landed yet is, by that
 definition, an orphan. Iceberg guards this with an age threshold, and
 `ORPHAN_AGE_DEFAULT` keeps the conservative three days rather than trimming it to make
 a demo look tidy: on this project the streams are stopped before maintenance runs, but
-the default has to be safe for the case where somebody forgets.
+the default has to be safe for the case where somebody forgets. Iceberg itself refuses
+an interval under 24 hours, for the same reason.
+
+It is also the only procedure that has to be told *how* to look at storage, because it
+is the only one that reads the object store directly rather than through the table's
+metadata. See `remove_orphan_files_sql`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -194,7 +200,33 @@ def rewrite_manifests_sql(table: str) -> str:
     return f"CALL {catalog}.system.rewrite_manifests(table => '{relative}')"
 
 
-def expire_snapshots_sql(table: str, *, older_than_hours: int, retain_last: int) -> str:
+def hours_ago(hours: int, *, now: datetime | None = None) -> datetime:
+    """A cutoff `hours` before now, in UTC.
+
+    Computed in Python rather than in SQL because the procedures below need a literal:
+    see `_timestamp_literal`. Taking `now` as an argument makes the generated statement
+    assertable in a unit test instead of only observable at runtime.
+    """
+    return (now or datetime.now(timezone.utc)) - timedelta(hours=hours)
+
+
+def _timestamp_literal(moment: datetime) -> str:
+    """A Spark `TIMESTAMP '...'` literal for `moment`, as UTC.
+
+    Iceberg's `CALL` binds *literal* arguments only. Passing an expression —
+    `older_than => TIMESTAMPADD(HOUR, -24, current_timestamp())`, which is the obvious
+    way to write "a day ago" — fails with `IllegalArgumentException: requirement
+    failed: number of args and params must match after binding`, a message that says
+    nothing about the actual problem and sends you counting arguments. Measured against
+    Iceberg 1.10.0; the working form is this one.
+
+    Rendered as UTC because the literal is interpreted in the session's zone, which
+    `streaming.session` pins to UTC for every job in this project.
+    """
+    return f"TIMESTAMP '{moment.astimezone(timezone.utc):%Y-%m-%d %H:%M:%S}'"
+
+
+def expire_snapshots_sql(table: str, *, older_than: datetime, retain_last: int) -> str:
     """Drop snapshots past the retention window, and the data files only they referenced.
 
     This is the procedure that actually frees disk after a compaction, and it is also
@@ -206,23 +238,40 @@ def expire_snapshots_sql(table: str, *, older_than_hours: int, retain_last: int)
     return (
         f"CALL {catalog}.system.expire_snapshots("
         f"table => '{relative}', "
-        f"older_than => TIMESTAMPADD(HOUR, -{older_than_hours}, current_timestamp()), "
+        f"older_than => {_timestamp_literal(older_than)}, "
         f"retain_last => {retain_last})"
     )
 
 
-def remove_orphan_files_sql(table: str, *, older_than_hours: int) -> str:
+def remove_orphan_files_sql(table: str, *, older_than: datetime) -> str:
     """Delete files in the table's directory that no metadata references.
 
     Orphans come from failed commits and from writes interrupted mid-flight — which
     this pipeline produces on purpose in the restart-idempotency proof. Read the
     warning in the module docstring before shortening the age.
+
+    `prefix_listing => true` is load-bearing on this stack, and it is the one procedure
+    where the choice of FileIO leaks into the SQL. Without it Iceberg lists the table's
+    directory through Hadoop's `FileSystem`, and the table's location is `s3://…` — a
+    scheme Hadoop has no implementation for, because `streaming.session` deliberately
+    routes storage through Iceberg's own `S3FileIO` instead of `s3a`. Measured, against
+    Iceberg 1.10.1 on the live catalog:
+
+        UnsupportedFileSystemException: No FileSystem for scheme "s3"
+          at FileSystemWalker.listDirRecursivelyWithHadoop(FileSystemWalker.java:122)
+          at DeleteOrphanFilesSparkAction.listedFileDS(...:329)
+
+    The flag switches that call to `listDirRecursivelyWithFileIO`, which uses the
+    table's own FileIO. Set unconditionally rather than probed, because the catalog is
+    configured in exactly one place and `S3FileIO` supports prefix listing; on a
+    `HadoopFileIO` warehouse this flag would be the thing that broke instead. ADR-0024.
     """
     catalog, relative = split_catalog(table)
     return (
         f"CALL {catalog}.system.remove_orphan_files("
         f"table => '{relative}', "
-        f"older_than => TIMESTAMPADD(HOUR, -{older_than_hours}, current_timestamp()))"
+        f"older_than => {_timestamp_literal(older_than)}, "
+        f"prefix_listing => true)"
     )
 
 

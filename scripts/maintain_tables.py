@@ -41,6 +41,7 @@ from wikistream.maintenance import (
     TableStats,
     collect_stats,
     expire_snapshots_sql,
+    hours_ago,
     remove_orphan_files_sql,
     rewrite_data_files_sql,
     rewrite_manifests_sql,
@@ -49,6 +50,8 @@ from wikistream.maintenance import (
 from wikistream.streaming.session import build_session
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from pyspark.sql import SparkSession
 
 log = get_logger("wikistream.maintain_tables")
@@ -67,8 +70,8 @@ def maintain(
     spark: SparkSession,
     table: str,
     *,
-    orphan_age_hours: int,
-    snapshot_age_hours: int,
+    orphan_cutoff: datetime,
+    snapshot_cutoff: datetime,
     target_bytes: int | None = None,
 ) -> tuple[TableStats, TableStats]:
     """Run all four procedures against one table; return its stats before and after.
@@ -76,6 +79,10 @@ def maintain(
     The order is deliberate and is explained in `wikistream.maintenance`: compaction
     first, then manifests, then expiry — which is what actually frees the disk the
     compaction just doubled — then orphans.
+
+    Both cutoffs are passed in rather than derived here so that every table in one run
+    is measured against the same instant. Recomputing "24 hours ago" per table would
+    make the boundary drift by however long the previous table took.
     """
     before = collect_stats(spark, table)
     print(f"\n{table}")
@@ -88,11 +95,11 @@ def maintain(
             "expire_snapshots",
             expire_snapshots_sql(
                 table,
-                older_than_hours=snapshot_age_hours,
+                older_than=snapshot_cutoff,
                 retain_last=RETAIN_LAST_SNAPSHOTS,
             ),
         ),
-        ("remove_orphan_files", remove_orphan_files_sql(table, older_than_hours=orphan_age_hours)),
+        ("remove_orphan_files", remove_orphan_files_sql(table, older_than=orphan_cutoff)),
     )
 
     for name, sql in steps:
@@ -134,6 +141,10 @@ def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
     configure_logging(settings.log_level, as_json=settings.log_json)
     spark = build_session("maintain-tables", settings)
+    # One instant for the whole run, so the two cutoffs mean the same thing for the
+    # third table as for the first.
+    orphan_cutoff = hours_ago(args.orphan_age_hours)
+    snapshot_cutoff = hours_ago(args.snapshot_age_hours)
     try:
         tables = (
             settings.bronze_raw_table,
@@ -144,8 +155,8 @@ def main(argv: list[str] | None = None) -> int:
             before, after = maintain(
                 spark,
                 table,
-                orphan_age_hours=args.orphan_age_hours,
-                snapshot_age_hours=args.snapshot_age_hours,
+                orphan_cutoff=orphan_cutoff,
+                snapshot_cutoff=snapshot_cutoff,
                 target_bytes=args.target_file_size_bytes,
             )
             log.info(
