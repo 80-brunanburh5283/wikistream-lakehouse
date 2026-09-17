@@ -98,7 +98,16 @@ else
 fi
 
 # Docker's data root, not the repository: images and volumes are what fill up.
-docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+#
+# `|| echo` is not enough of a fallback here. When the daemon is up but broken —
+# which is what running out of disk looks like — `docker info` exits 0 and writes
+# only an error to stderr, so the fallback never fires and the check ends up
+# measuring the empty string and reporting "0 GB free on ". Test the result, not
+# the exit code.
+docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
+if [[ -z "${docker_root}" || ! -d "${docker_root}" ]]; then
+  docker_root=/
+fi
 avail_gb=$(df -BG --output=avail "${docker_root}" 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
 avail_gb=${avail_gb:-0}
 if (( avail_gb >= 20 )); then
@@ -107,6 +116,43 @@ elif (( avail_gb >= 10 )); then
   warn "${avail_gb} GB free on ${docker_root}. Images alone are about 4 GB; a day of Kafka retention plus Iceberg data will want more."
 else
   bad "${avail_gb} GB free on ${docker_root} is not enough. About 15 GB is needed for images and a day of data."
+fi
+
+# The check above measures a Linux filesystem, and under Docker Desktop that is the
+# wrong one. Docker Desktop keeps images and volumes in a VHDX on a Windows volume,
+# whose free space `df` inside WSL cannot see — so the Linux side can report
+# hundreds of gigabytes spare while Docker has none at all.
+#
+# The failure mode is worth describing, because nothing about it mentions disk. The
+# VHDX grows on demand; when the Windows volume is full it cannot, the ext4 inside
+# it takes an I/O error, and because it is mounted `errors=remount-ro` it goes
+# read-only. The daemon then answers every request with HTTP 500 — including
+# /_ping, so `docker ps` fails too — and a build that was running dies with
+# "read-only file system" naming a path inside /var/lib/docker that does not exist
+# on this side of the boundary. Recovering needs free space on Windows first.
+if grep -qi microsoft /proc/version 2>/dev/null && [[ -d /mnt/wsl/docker-desktop ]]; then
+  # The documented default location. If the user has moved it, the glob misses and
+  # the check falls back to C:, which is still the right drive to look at nine
+  # times out of ten and is never worse than saying nothing.
+  vhdx=$(ls -1 /mnt/c/Users/*/AppData/Local/Docker/wsl/disk/docker_data.vhdx 2>/dev/null | head -1)
+  win_avail_gb=$(df -BG --output=avail /mnt/c 2>/dev/null | tail -1 | tr -dc '0-9')
+  win_avail_gb=${win_avail_gb:-}
+  if [[ -z "${win_avail_gb}" ]]; then
+    warn "Docker Desktop detected but the Windows C: volume is not mounted here, so its free space could not be checked. Docker's disk lives there, not on this filesystem."
+  else
+    vhdx_note=""
+    if [[ -n "${vhdx}" ]]; then
+      vhdx_gb=$(( $(stat -c %s "${vhdx}" 2>/dev/null || echo 0) / 1024 / 1024 / 1024 ))
+      vhdx_note=" (docker_data.vhdx is currently ${vhdx_gb} GB)"
+    fi
+    if (( win_avail_gb >= 15 )); then
+      ok "${win_avail_gb} GB free on the Windows volume Docker Desktop stores its disk on${vhdx_note}"
+    elif (( win_avail_gb >= 3 )); then
+      warn "only ${win_avail_gb} GB free on Windows C:${vhdx_note}. Docker Desktop's disk grows into that space. Pulling this stack's images needs about 12 GB the first time."
+    else
+      bad "${win_avail_gb} GB free on Windows C:${vhdx_note}. Docker Desktop cannot grow its disk, and when it runs out the daemon starts answering every request with HTTP 500. Free space on C: — 'docker system prune' and Windows Disk Cleanup are the usual two — before running make up."
+    fi
+  fi
 fi
 echo
 
