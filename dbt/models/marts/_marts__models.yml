@@ -1,0 +1,321 @@
+version: 2
+
+models:
+  # ------------------------------------------------------------------ dimension
+  - name: dim_wikis
+    description: >
+      One row per wiki, with the plurality domain, the number of domains that wiki
+      was seen under, and lifetime activity totals. Rebuilt in full on every run:
+      it has a few hundred rows and the shares in it are cumulative, so an
+      incremental version would have to re-read everything anyway.
+    columns:
+      - name: wiki
+        description: "MediaWiki database name, e.g. `enwiki`. The grain."
+        data_tests:
+          - unique
+          - not_null
+      - name: primary_domain
+        description: >
+          The domain this wiki emitted the most events under. Not a key: see
+          `domain_count`. Chosen with `max_by`, which the singular test
+          `assert_dim_wikis_primary_domain_was_observed` checks was written the
+          right way round.
+        data_tests:
+          - not_null
+      - name: domain_count
+        description: >
+          How many distinct domains this wiki was seen under. Greater than 1 for 84
+          of 370 wikis on the sample this was written against, because central
+          authentication log events arrive under `auth.wikimedia.org` regardless of
+          which wiki they belong to. Kept as a column so that a query grouping by
+          domain and calling the result "per wiki" is visibly wrong rather than
+          quietly wrong.
+        data_tests:
+          - not_null
+      - name: first_seen_at
+        description: "Earliest event time observed for this wiki. UTC."
+        data_tests:
+          - not_null
+      - name: last_seen_at
+        description: "Latest event time observed for this wiki. UTC."
+        data_tests:
+          - not_null
+      - name: total_events
+        description: "All non-canary events for this wiki, every change type."
+        data_tests:
+          - not_null
+      - name: bot_events
+        description: "Events whose editor the source flagged as a bot."
+      - name: human_events
+        description: "`total_events - bot_events`. Exhaustive because `is_bot` is never null off canary."
+      - name: article_events
+        description: "Events in namespace 0."
+      - name: anonymous_events
+        description: "Events by an IP address or a MediaWiki temporary account."
+      - name: events_with_bytes
+        description: >
+          Events that carried a page length. The correct denominator for the byte
+          columns — `total_events` is not, because `categorize` and `log` events
+          have no length and make up most of the firehose.
+      - name: bytes_added
+        description: "Sum of positive `bytes_delta`. Nulls contribute 0, not null."
+      - name: bytes_removed
+        description: "Sum of negative `bytes_delta`, so this column is <= 0."
+      - name: bytes_net
+        description: "`bytes_added + bytes_removed`. Net page-size change across the wiki."
+      - name: bot_share
+        description: "`bot_events / total_events`, to four decimal places."
+      - name: article_share
+        description: "`article_events / total_events`, to four decimal places."
+
+  # ------------------------------------------------------------------- minutely
+  - name: mart_edits_per_minute
+    description: >
+      Events per minute per wiki per change type. Incremental with strategy
+      `merge`, keyed on the full grain, recomputing the boundary minute on every
+      run so the partial minute a run lands in gets corrected rather than frozen.
+      Partitioned by `day(event_minute)` and sorted by `event_minute`, which is
+      how a "last six hours" query reads two files instead of all of them.
+    data_tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [event_minute, wiki, change_type]
+    columns:
+      - name: event_minute
+        description: "`event_time` truncated to the minute. UTC. Iceberg partition source."
+        data_tests:
+          - not_null
+      - name: wiki
+        description: "MediaWiki database name. Never null here, because canary events are excluded."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_wikis')
+                field: wiki
+      - name: change_type
+        description: >
+          `edit`, `new`, `log` or `categorize`. Part of the grain rather than
+          summed away, because `categorize` outnumbers `edit` and a chart that
+          adds them together is not a chart of editing activity.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [edit, new, log, categorize]
+      - name: events
+        description: "Row count for the bucket."
+        data_tests:
+          - not_null
+      - name: distinct_editors
+        description: >
+          Distinct `editor` values in the bucket. Correct only because the boundary
+          minute is recomputed in full — a distinct count cannot be merged from a
+          partial recomputation.
+      - name: distinct_pages
+        description: "Distinct `page_title` values in the bucket."
+      - name: bot_events
+        description: "Of `events`, how many the source flagged as bot edits."
+      - name: article_events
+        description: "Of `events`, how many were in namespace 0."
+      - name: events_with_bytes
+        description: "Of `events`, how many carried a page length."
+      - name: bytes_added
+        description: "Sum of positive `bytes_delta` in the bucket."
+      - name: bytes_removed
+        description: "Sum of negative `bytes_delta` in the bucket, so <= 0."
+
+  # ------------------------------------------------------------ bot vs human
+  - name: mart_bot_vs_human_hourly
+    description: >
+      Bot and human activity side by side, per wiki per hour. Incremental `merge`
+      on (event_hour, wiki) with the same boundary-bucket treatment as
+      `mart_edits_per_minute`. The two populations are columns rather than a
+      dimension so the ratio needs no self-join.
+    data_tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [event_hour, wiki]
+    columns:
+      - name: event_hour
+        description: "`event_time` truncated to the hour. UTC. Iceberg partition source."
+        data_tests:
+          - not_null
+      - name: wiki
+        description: "MediaWiki database name."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_wikis')
+                field: wiki
+      - name: events
+        description: "All non-canary events in the bucket."
+        data_tests:
+          - not_null
+      - name: bot_events
+        description: "Events flagged as bot edits by the source."
+      - name: human_events
+        description: >
+          Events not flagged as bot edits. Together with `bot_events` this covers
+          every row, which the singular test
+          `assert_bot_human_split_is_exhaustive` asserts rather than assumes.
+      - name: bot_editors
+        description: "Distinct bot accounts active in the bucket."
+      - name: human_editors
+        description: "Distinct non-bot editors active in the bucket."
+      - name: bot_events_with_bytes
+        description: "Bot events that carried a page length. The denominator for `bot_bytes_net`."
+      - name: human_events_with_bytes
+        description: "Human events that carried a page length."
+      - name: bot_bytes_net
+        description: "Net page-size change attributable to bots, in bytes. Nulls count as 0."
+      - name: human_bytes_net
+        description: "Net page-size change attributable to humans, in bytes."
+      - name: bot_share
+        description: "`bot_events / events`, to four decimal places."
+
+  # -------------------------------------------------------------- top pages
+  - name: mart_top_pages_hourly
+    description: >
+      The ten most-edited pages per wiki per hour, ranked. Incremental with
+      strategy `delete+insert` rather than `merge`, because top-N is not additive:
+      a merge would leave a page that fell out of the ten behind at its stale rank
+      and the "top ten" would grow an eleventh row. Read the header comment in the
+      model before changing the strategy.
+    data_tests:
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [event_hour, wiki, rank_in_wiki]
+      - unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [event_hour, wiki, page_title]
+    columns:
+      - name: event_hour
+        description: >
+          `event_time` truncated to the hour. UTC. Also the `unique_key` of the
+          incremental config, which for `delete+insert` names the delete predicate
+          and not a key — the target holds up to ten rows per hour per wiki.
+        data_tests:
+          - not_null
+      - name: wiki
+        description: "MediaWiki database name."
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_wikis')
+                field: wiki
+      - name: rank_in_wiki
+        description: >
+          1 to 10, by event count descending, ties broken on `page_title` so the
+          ranking is stable across runs. Contiguity is asserted by
+          `assert_top_pages_rank_is_contiguous`.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+                quote: false
+      - name: page_title
+        description: "Page title as displayed. Never null here — rows without one are filtered out."
+        data_tests:
+          - not_null
+      - name: page_url
+        description: "Canonical URL. Null where the source omitted it on every event for the page."
+      - name: events
+        description: "Events against this page in this hour on this wiki."
+        data_tests:
+          - not_null
+      - name: distinct_editors
+        description: "Distinct editors who touched the page in the hour."
+      - name: bot_events
+        description: "Of `events`, how many were bot edits."
+      - name: is_article
+        description: >
+          True if any event for the page in this hour was in namespace 0.
+          `bool_or`, not `every`: namespace is a property of the page, so a
+          disagreement within the hour means a move, and treating a moved page as
+          an article is the less surprising of the two answers.
+      - name: bytes_net
+        description: "Net page-size change for the page over the hour. Nulls count as 0."
+
+  # ---------------------------------------------------------- pipeline health
+  - name: mart_pipeline_health
+    description: >
+      One row per hour about the pipeline rather than the wikis: volume, lateness
+      percentiles, quarantine rate, and the canary heartbeat count. The only model
+      that keeps canary events, because two of them per hour is what "the source
+      is still connected" looks like. Rebuilt in full — a few hundred rows, and
+      incrementalising it would buy nothing but the boundary-bucket problem.
+    columns:
+      - name: bucket_hour
+        description: >
+          The hour. `coalesce(event_hour, failed_hour)`, because the two inputs are
+          on different clocks and the join is a full outer one — an hour that
+          produced only quarantined rows still gets a row here. See the model
+          header for why that approximation is acceptable and where it is not.
+        data_tests:
+          - unique
+          - not_null
+      - name: events
+        description: "All rows in `silver.edits` for the hour, canary events included."
+        data_tests:
+          - not_null
+      - name: canary_events
+        description: >
+          Wikimedia's synthetic heartbeats. Two per hour, at :15, is healthy. Zero
+          in a complete hour means the stream connection dropped rather than the
+          wikis going quiet. No boolean is derived from it because the newest
+          bucket is always partial.
+        data_tests:
+          - not_null
+      - name: bot_events
+        description: "Non-canary events flagged as bot edits."
+        data_tests:
+          - not_null
+      - name: quarantined_events
+        description: "Rows the silver validation rejected, bucketed on ingest time."
+        data_tests:
+          - not_null
+      - name: distinct_failure_reasons
+        description: "How many of the seven validation rules fired in the hour."
+        data_tests:
+          - not_null
+      - name: distinct_wikis
+        description: "Distinct wikis active in the hour."
+        data_tests:
+          - not_null
+      - name: distinct_domains
+        description: "Distinct domains seen in the hour. Not equal to `distinct_wikis`; see `dim_wikis`."
+        data_tests:
+          - not_null
+      - name: events_without_bytes
+        description: >
+          Rows with a null `bytes_delta`. Tracked as an absolute number rather than
+          a rate because the interesting change would be a sudden move in it — the
+          steady state is most of the firehose.
+        data_tests:
+          - not_null
+      - name: first_event_at
+        description: "Earliest event time in the bucket. Null only for a quarantine-only hour."
+      - name: last_event_at
+        description: "Latest event time in the bucket."
+      - name: last_ingested_at
+        description: >
+          When the last Spark batch to write into this hour ran. Compared against
+          `last_event_at`, the gap is end-to-end pipeline latency for the bucket.
+      - name: late_p50_seconds
+        description: "Median `ingested_at - event_time` for the bucket. `approx_percentile`."
+      - name: late_p95_seconds
+        description: "95th percentile lateness. The figure the watermark is sized against."
+      - name: late_p99_seconds
+        description: "99th percentile lateness."
+      - name: late_max_seconds
+        description: "Worst lateness in the bucket. Exact, not approximate."
+      - name: quarantine_rate
+        description: >
+          `quarantined / (events + quarantined)`, to six decimal places. An
+          approximation, because the numerator and denominator are bucketed on
+          different clocks — good enough to alert on, not good enough to reconcile
+          against.
