@@ -175,6 +175,10 @@ verify-no-duplicates: ## Exit non-zero if silver.edits contains any duplicate ev
 table-stats: ## Row counts and file statistics for bronze and silver
 	$(SPARK_SUBMIT) /opt/wikistream/scripts/table_stats.py
 
+.PHONY: sql
+sql: ## Run one statement against the Iceberg catalog: SQL="SELECT ..." [JSON=--json]
+	@$(SPARK_SUBMIT) /opt/wikistream/scripts/spark_sql.py $(JSON) "$(SQL)"
+
 # ------------------------------------------------------------------ analytics
 
 .PHONY: query
