@@ -1,0 +1,155 @@
+[project]
+name = "wikistream-lakehouse"
+version = "0.1.0"
+description = "Wikipedia's live edit stream into Kafka, Spark Structured Streaming into Apache Iceberg, dbt marts over Trino, orchestrated by Dagster."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "William Ankan Sarkar" }]
+keywords = ["kafka", "spark", "iceberg", "lakehouse", "streaming", "dbt", "dagster", "trino"]
+classifiers = [
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Database",
+  "Topic :: System :: Distributed Computing",
+]
+
+dependencies = [
+  # Long-lived HTTP/1.1 streaming with independent connect and read timeouts.
+  # requests cannot express a read timeout that resets per SSE chunk as cleanly.
+  "httpx>=0.28.1,<0.29",
+  # librdkafka bindings: the only Python client with a real idempotent producer.
+  "confluent-kafka>=2.15.1,<2.16",
+  "pydantic>=2.12.0,<3",
+  "pydantic-settings>=2.15.0,<3",
+  # Must match the Spark version in docker-compose.yml exactly; a driver/cluster
+  # mismatch fails at job submission with an opaque py4j error.
+  "pyspark==4.0.4",
+  # Only for the Jetstream fallback source.
+  "websockets>=17.1,<18",
+]
+
+[project.urls]
+Homepage = "https://github.com/william-sarkar/wikistream-lakehouse"
+Repository = "https://github.com/william-sarkar/wikistream-lakehouse"
+
+[dependency-groups]
+dev = [
+  "ruff>=0.16.8,<0.17",
+  "mypy>=2.3.1,<3",
+  "pytest>=9.1.1,<10",
+  "pytest-cov>=7.1.0,<8",
+  "sqlfluff>=4.3.0,<5",
+  "pre-commit>=4.4.0,<5",
+]
+# dbt and the Trino client. Kept in a group because the transform layer runs in
+# its own container and does not belong in the streaming runtime's dependency set.
+analytics = [
+  "dbt-core>=1.12.5,<1.13",
+  "dbt-trino>=1.10.4,<1.11",
+  "trino>=0.339.0,<0.340",
+  "duckdb>=1.5.5,<1.6",
+]
+orchestration = [
+  "dagster>=1.13.23,<1.14",
+  "dagster-webserver>=1.13.23,<1.14",
+  "dagster-dbt>=0.29.23,<0.30",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# wikistream_dagster is a sibling package rather than a `dagster/` directory at
+# the repo root: a top-level `dagster/` would shadow the installed `dagster`
+# package on sys.path and break both `python -m` and mypy's module resolution.
+packages = ["src/wikistream", "src/wikistream_dagster"]
+
+[tool.uv]
+default-groups = ["dev", "analytics", "orchestration"]
+
+# ----------------------------------------------------------------------------
+# Lint and format
+# ----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["dbt/target", "dbt/dbt_packages"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes
+  "I",        # isort
+  "N",        # pep8-naming
+  "UP",       # pyupgrade
+  "B",        # bugbear
+  "C4",       # comprehensions
+  "SIM",      # simplify
+  "PTH",      # use pathlib
+  "RET",      # return consistency
+  "ARG",      # unused arguments
+  "TID",      # tidy imports
+  "T20",      # no print() outside scripts
+  "RUF",
+  "D",        # docstrings
+  "ANN",      # type annotations
+]
+ignore = [
+  "D100",  # module docstring not required on every module
+  "D104",  # package docstring not required
+  "D203",  # conflicts with D211
+  "D213",  # conflicts with D212
+  "ANN401", # Any is sometimes correct (JSON payloads)
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests document themselves through their names; scripts are CLIs and print.
+"tests/**" = ["D", "ANN", "ARG", "S101"]
+"scripts/**" = ["T20", "D103"]
+"src/wikistream_dagster/**" = ["D103"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+# ----------------------------------------------------------------------------
+# Types
+# ----------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+files = ["src"]
+mypy_path = "src"
+explicit_package_bases = true
+strict = true
+warn_unreachable = true
+pretty = true
+
+[[tool.mypy.overrides]]
+module = ["confluent_kafka.*", "pyspark.*", "duckdb.*", "dagster_dbt.*", "trino.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+strict = false
+disallow_untyped_defs = false
+
+# ----------------------------------------------------------------------------
+# Tests
+# ----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config -ra"
+markers = [
+  "unit: pure-Python tests. No network, no Docker, no JVM. Must stay under a second each.",
+  "integration: needs the core compose profile running. Skipped when it is not.",
+  "e2e: the restart-idempotency proof. Needs the full stack and takes minutes.",
+]
+filterwarnings = ["error::DeprecationWarning:wikistream.*"]
+
+[tool.coverage.run]
+source = ["src/wikistream"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError"]
