@@ -282,9 +282,13 @@ def to_candidates(frames: DataFrame) -> DataFrame:
         .withColumn("rev_old", F.col("_parsed.revision.old"))
         .withColumn("rev_new", F.col("_parsed.revision.new"))
         .withColumn("comment", F.col("_parsed.comment"))
+        # No cast. `unix_timestamp` returns a bigint and the column is a bigint, because
+        # a `.cast("int")` here raised under ANSI mode on a payload stamped 2099 —
+        # lateness is computed before the rule that rejects such a row, so the cast saw
+        # -2.28e9 and killed the batch. Matching the widths removes the failure mode.
         .withColumn(
             "late_by_seconds",
-            (F.unix_timestamp("ingested_at") - F.unix_timestamp("event_time")).cast("int"),
+            F.unix_timestamp("ingested_at") - F.unix_timestamp("event_time"),
         )
         .withColumn("event_date", F.to_date(F.col("event_time")))
         .withColumn("failed_at", F.col("ingested_at"))

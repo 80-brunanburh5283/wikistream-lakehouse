@@ -152,11 +152,15 @@ CREATE TABLE IF NOT EXISTS {cfg.silver_edits_table} (
   rev_old          bigint,
   rev_new          bigint,
   comment          string,
-  -- int is safe here where it was not above, because it is bounded by a validation
-  -- rule rather than by hope: `event_time_before_wikipedia` rejects any event_time
-  -- below 2001-01-15, so lateness cannot exceed now minus that date — 7.8e8 seconds
-  -- today, and inside int32 until 2069.
-  late_by_seconds  int       COMMENT 'ingested_at - event_time; negative means clock skew',
+  -- bigint for the same reason as the three columns above, and I got this one wrong
+  -- first: I argued int was safe because `event_time_before_wikipedia` bounds how late
+  -- an event can be. It bounds lateness in one direction only. A payload stamped 2099
+  -- yields -2,281,290,900 seconds, which overflows int32, and the value is computed
+  -- for every row *before* the rule that rejects it gets to run — so the narrowing
+  -- cast raised, the micro-batch died, and it would have died again on replay.
+  -- tests/spark/test_silver_mapping.py::test_every_frame_lands_in_exactly_one_table
+  -- is what found it.
+  late_by_seconds  bigint    COMMENT 'ingested_at - event_time; negative means clock skew',
   ingested_at      timestamp,
   event_date       date      COMMENT 'partition column, derived from event_time'
 )
