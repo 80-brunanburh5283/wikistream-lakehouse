@@ -1,0 +1,75 @@
+#  The Dagster instance, read by both the webserver and the daemon.
+#
+#  Both processes mount this same file and share one SQLite database on a named
+#  volume, which is what makes them one deployment rather than two: the daemon
+#  writes a run into the run store, the run launcher picks it up, and the
+#  webserver reads its events out of the same event log. Give them separate
+#  storage and the UI shows an empty timeline while the schedules fire happily
+#  into the void.
+#
+#  Everything here is a default that has been changed for a stated reason.
+#  Anything Dagster's default gets right on a 10 GB laptop is left alone, and
+#  that includes the two biggest pieces of machinery:
+#
+#    * **Storage is SQLite**, not Postgres. Postgres is the documented choice for
+#      a real deployment and it would be one more container, one more 200 MB
+#      resident set, and one more thing to be healthy before `make up` returns.
+#      The write rate here is a handful of events per minute. See DECISIONS.md
+#      ADR-0033.
+#    * **The run launcher is the default**, which runs each launched run as a
+#      subprocess of whichever container serves the code location. That is why
+#      there is no `dagster api grpc` service: with `-m wikistream_dagster.definitions`
+#      the webserver and the daemon each load the graph in-process, so a run
+#      launched from the UI executes beside the webserver and a scheduled run
+#      executes beside the daemon. The cost is that a code-location import error
+#      is visible in the UI rather than isolated in a separate process, and the
+#      saving is a third JVM-sized container this machine does not have room for.
+
+telemetry:
+  # Off. The README claims this stack reaches the network in exactly two places —
+  # the Wikimedia stream and the container registries — and a usage ping to
+  # telemetry.elementl.dev would make that claim false. dbt's
+  # `send_anonymous_usage_stats: false` is the same decision in the other tool.
+  enabled: false
+
+concurrency:
+  runs:
+    # One run at a time, and the constraint is Trino rather than Dagster. All
+    # three jobs reach the same 2 GB coordinator: `build_marts` runs seven models
+    # and sixty-one tests through it, `maintain_gold` rewrites data files through
+    # it, and `observe_lakehouse` counts rows through it. Two of those at once on
+    # this heap is a queued query at best and a commit conflict on the same
+    # Iceberg table at worst.
+    #
+    # The queue is not free — an observation tick can wait behind a mart build —
+    # and that is affordable on purpose: the freshness check tolerates 15 minutes
+    # of lag and a mart build takes well under one, so a delayed observation
+    # cannot turn a healthy pipeline red.
+    max_concurrent_runs: 1
+
+run_monitoring:
+  # The failure mode this exists for is specific and this machine has it: a run
+  # subprocess killed by the OOM killer never writes a failure event, so without
+  # monitoring the run sits in STARTED for ever, the UI shows the pipeline as
+  # busy, and the next scheduled tick queues behind a run that is already dead.
+  # With it on, the daemon notices the missing process and fails the run, which
+  # is also what makes the run-failure sensor in `sensors.py` fire.
+  enabled: true
+  # Generous, because the first run after `make up` pays for importing dagster,
+  # dagster-dbt and dbt-core in a fresh subprocess on a cold page cache.
+  start_timeout_seconds: 300
+  poll_interval_seconds: 30
+
+retention:
+  # `observe_lakehouse` runs every two minutes: 720 ticks a day, ~22,000 a month,
+  # all of them successful and none of them interesting after the fact. Dagster
+  # keeps tick history for ever by default, and on SQLite that is a file that
+  # grows without bound for no benefit. A week is long enough to answer "when did
+  # this start failing" on a laptop stack.
+  #
+  # Run history is *not* purged: those are the records that prove the pipeline
+  # ran, and there are three jobs' worth rather than tens of thousands.
+  schedule:
+    purge_after_days: 7
+  sensor:
+    purge_after_days: 7

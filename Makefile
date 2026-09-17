@@ -237,15 +237,35 @@ dbt-docs: ## Generate the dbt docs site into dbt/target (gitignored)
 dagster: ## Open the Dagster UI URL
 	@echo "Dagster UI: http://localhost:$${WS_DAGSTER_PORT:-3000}"
 
-.PHONY: dagster-materialise-all
-dagster-materialise-all: ## Materialise every Dagster asset from the CLI
-	$(COMPOSE) exec -T dagster-webserver \
-	  dagster asset materialize --select '*' -m wikistream_dagster.definitions
+# The three job targets below run the job synchronously inside the webserver
+# container with `dagster job execute`, rather than enqueuing it with `dagster job
+# launch`. Two reasons: the exit code is the job's, which is what makes these
+# usable in the acceptance script and in CI; and the schedules ship stopped, so
+# nothing else is running and there is no queue to respect.
+#
+# There is no "materialise everything" target, and that is not an omission.
+# `dagster asset materialize --select '*'` cannot work here: five of the thirteen
+# assets are external — the producer and the two Spark queries — and Dagster has no
+# way to execute them. The three jobs below are a partition of everything that
+# genuinely can be run, and tests/unit/test_dagster_jobs.py asserts that.
+DAGSTER_EXEC := $(COMPOSE) exec -T dagster-webserver dagster job execute \
+                  -m wikistream_dagster.definitions -j
 
-.PHONY: dagster-check-all
-dagster-check-all: ## Run every Dagster asset check from the CLI
-	$(COMPOSE) exec -T dagster-webserver \
-	  dagster job execute -j asset_checks_job -m wikistream_dagster.definitions
+.PHONY: dagster-observe
+dagster-observe: ## Observe the streaming tables and run their health checks
+	$(DAGSTER_EXEC) observe_lakehouse
+
+.PHONY: dagster-marts
+dagster-marts: ## Build the dbt models through Dagster, with their tests as checks
+	$(DAGSTER_EXEC) build_marts
+
+.PHONY: dagster-maintain
+dagster-maintain: ## Compact the gold tables and expire their old snapshots
+	$(DAGSTER_EXEC) maintain_gold
+
+.PHONY: dagster-validate
+dagster-validate: ## Load the definitions and check them, without Docker
+	$(UV) run dagster definitions validate -m wikistream_dagster.definitions
 
 # ------------------------------------------------------------------- quality
 

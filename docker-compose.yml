@@ -323,6 +323,107 @@ services:
       retries: 18
       start_period: 15s
 
+  # ----------------------------------------------------------------- dagster
+  #
+  # The control plane, as two containers from one image (docker/dagster.Dockerfile
+  # explains why one image). They share `dagster-home`, so they share the run
+  # store, the event log and the schedule state — the daemon writes a queued run,
+  # the webserver shows it, and neither is the source of truth on its own.
+  #
+  # What Dagster is and is not responsible for here is the whole point of ADR-0030
+  # and worth stating where a reader of this file will see it: the producer and the
+  # two Spark queries are long-running processes that Compose supervises, and
+  # Dagster *observes* them rather than running them. It runs what genuinely is
+  # batch — the dbt marts and the gold-table compaction — and it runs the asset
+  # checks that say whether the streaming half is healthy. So stopping Dagster does
+  # not stop the pipeline; it stops the pipeline being watched.
+  dagster-webserver:
+    build:
+      context: .
+      dockerfile: docker/dagster.Dockerfile
+    image: wikistream/dagster:local
+    container_name: wikistream-dagster-webserver
+    profiles: ["full"]
+    logging: *logging
+    depends_on:
+      # Trino, because every asset check and every dbt model goes through it. Kafka,
+      # because the observation of the bronze asset reads the topic's high
+      # watermarks. Not Spark: Dagster never submits to it.
+      trino:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "${WS_DAGSTER_PORT:-3000}:3000"
+    env_file:
+      - path: .env
+        required: false
+    environment: &dagster-env
+      # In-network addresses, overriding anything `.env` says for a host process.
+      WS_TRINO_HOST: trino
+      WS_TRINO_PORT: 8080
+      WS_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # No AWS credentials, deliberately. Dagster reads and writes these tables
+      # only through Trino, so it has no reason to hold object-store keys — and
+      # `make up` with an empty `.env` proves it, because it works.
+    volumes: &dagster-volumes
+      # Read-only, unlike the dbt service's mount of the same directory: this
+      # container is given the models to run, not a place to work. The artefacts
+      # dbt would otherwise write beside them go to /tmp — see the Dockerfile.
+      - ./dbt:/opt/dbt:ro
+      # The instance database. A named volume rather than a bind mount because
+      # nothing in it is meant to be read from the host, and SQLite over a
+      # 9p/virtiofs mount is a locking problem waiting for a witness.
+      - dagster-home:/opt/dagster/home
+      # Mounted into the volume on top of itself, so the config is reviewable in
+      # git while the database it configures stays out of it.
+      - ./docker/dagster/dagster.yaml:/opt/dagster/home/dagster.yaml:ro
+    healthcheck:
+      # /server_info answers as soon as the ASGI app is up, which is before the code
+      # location has finished importing. That is the right thing to wait for here:
+      # `make up --wait` should return when the UI is reachable, and a code-location
+      # error is something the UI is there to show.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:3000/server_info >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    stop_grace_period: 20s
+
+  # The scheduler, the sensor loop, the run queue and the run monitor. Everything
+  # in dagster.yaml that says "the daemon" is this container, and without it the
+  # schedules in `schedules.py` are just rows in a table: the UI would show them as
+  # running and nothing would ever fire.
+  dagster-daemon:
+    build:
+      context: .
+      dockerfile: docker/dagster.Dockerfile
+    image: wikistream/dagster:local
+    container_name: wikistream-dagster-daemon
+    profiles: ["full"]
+    logging: *logging
+    depends_on:
+      # The webserver, so that the two do not race to create the same SQLite
+      # schema on a first `make up` — whichever loses gets "table already exists".
+      dagster-webserver:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment: *dagster-env
+    volumes: *dagster-volumes
+    command: ["dagster-daemon", "run", "-m", "wikistream_dagster.definitions"]
+    healthcheck:
+      # Asks the instance whether the daemon has written a heartbeat recently,
+      # which is a liveness check on the scheduler loop rather than on the process.
+      # A daemon whose loop is wedged still has a live PID.
+      test: ["CMD-SHELL", "dagster-daemon liveness-check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 20s
+
   # --------------------------------------------------------------------- dbt
   #
   # A one-shot, not a service: `docker compose run --rm dbt <args>`, which is what
@@ -404,3 +505,4 @@ volumes:
   minio-data:
   iceberg-catalog:
   spark-checkpoints:
+  dagster-home:
