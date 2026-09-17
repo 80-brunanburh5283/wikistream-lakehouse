@@ -1,0 +1,66 @@
+#  The transform layer. Reads lakehouse.silver.edits through Trino, writes gold
+#  marts back into the same Iceberg catalog.
+#
+#  Two structural choices worth explaining before the config:
+#
+#  1. **One schema, not one per layer.** Everything dbt builds lands in the
+#     `gold` namespace, and the `stg_` / `dim_` / `mart_` prefixes carry the
+#     layer. The alternative — dbt's `+schema:` config, which *appends* to the
+#     target schema and would give `gold_staging` — means dbt creating Iceberg
+#     namespaces at run time, and a `make clean` then leaves namespaces behind
+#     that `init_tables.py` does not know to recreate. The layering is legible
+#     from the names and from models/ directory structure either way.
+#
+#  2. **No packages.yml.** dbt_utils would be the obvious addition, and it is
+#     left out on purpose: every generic test this project needs is in dbt core
+#     (`unique`, `not_null`, `accepted_values`, `relationships`) and the rest is
+#     four singular tests of a dozen lines each. Adding the package would make
+#     `make dbt-run` on a fresh clone depend on reaching hub.getdbt.com, and the
+#     one network dependency this stack is allowed is the Wikimedia stream. See
+#     DECISIONS.md ADR-0026.
+
+name: wikistream
+version: 1.0.0
+config-version: 2
+
+profile: wikistream
+
+model-paths: ["models"]
+test-paths: ["tests"]
+macro-paths: ["macros"]
+analysis-paths: ["analyses"]
+seed-paths: ["seeds"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - target
+  - dbt_packages
+
+flags:
+  # Off, and stated rather than left to the default so it is reviewable. This
+  # project reaches the network in exactly two places and neither is dbt.
+  send_anonymous_usage_stats: false
+  # Fail rather than warn when a model's config references something unknown.
+  # A silently ignored typo in `unique_key` produces a mart that duplicates on
+  # every run and looks fine until someone counts.
+  require_resource_names_without_spaces: true
+
+models:
+  wikistream:
+    # Note what is *not* set here: `+table_format: iceberg`. dbt-trino turns that
+    # into a `type = 'ICEBERG'` table property, which is how Starburst and the
+    # Hive connector select a table format — the native Iceberg connector rejects
+    # the property outright, because for it there is nothing to select. Same for
+    # `+file_format`: docker/trino/catalog/lakehouse.properties already sets
+    # Parquet and zstd for the whole catalog, so repeating it per model would be
+    # two places to change and one place to forget.
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
+
+tests:
+  wikistream:
+    # A failing test is a failing build here. The two tests configured
+    # `severity: warn` say so in their own YAML, with the reason.
+    +severity: error

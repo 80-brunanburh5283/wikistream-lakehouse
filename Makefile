@@ -13,10 +13,14 @@ COMPOSE       ?= docker compose
 UV            ?= uv
 PROJECT       ?= wikistream
 SPARK_SUBMIT  := $(COMPOSE) exec -T spark /opt/spark/bin/spark-submit
+# dbt runs as a one-shot container. It writes target/ and logs/ into the bind
+# mounted project directory, so it has to run as whoever owns that directory —
+# otherwise a `make dbt-run` leaves root-owned artefacts in the working tree.
+export WS_DOCKER_USER := $(shell id -u):$(shell id -g)
 DBT           := $(COMPOSE) run --rm dbt
 
 # Every profile, for the targets that must not miss a container: down, clean, ps.
-ALL_PROFILES  := --profile full --profile producer
+ALL_PROFILES  := --profile full --profile producer --profile dbt
 
 # Containers reach the broker on the in-network listener. localhost:9092 is the
 # host listener and is not resolvable from inside the compose network.
@@ -41,6 +45,10 @@ LAG_SECONDS ?= 120
 # show expiry doing something without waiting a week for the age threshold to pass.
 # The figures in docs/lakehouse.md come from a run with exactly that argument.
 MAINTAIN_ARGS ?=
+
+# Extra arguments for the dbt targets, e.g. DBT_ARGS="--select mart_bot_vs_human_hourly"
+# or DBT_ARGS="--full-refresh". Same reasoning as PYTEST_ARGS above.
+DBT_ARGS ?=
 
 .PHONY: help
 help: ## Show this help
@@ -203,20 +211,24 @@ query: ## Run the headline queries through Trino
 query-duckdb: ## Read the same Iceberg tables with DuckDB, no JVM (core profile path)
 	$(UV) run python scripts/query_duckdb.py
 
-.PHONY: dbt-deps
-dbt-deps: ## Install dbt packages
-	$(DBT) deps
-
 .PHONY: dbt-run
-dbt-run: ## Build the gold marts
-	$(DBT) build --exclude-resource-type test
+dbt-run: ## Build the staging views and the gold marts
+	$(DBT) run $(DBT_ARGS)
 
 .PHONY: dbt-test
 dbt-test: ## Run dbt schema and singular tests
-	$(DBT) test
+	$(DBT) test $(DBT_ARGS)
+
+.PHONY: dbt-build
+dbt-build: ## Build every model and run every test, in dependency order
+	$(DBT) build $(DBT_ARGS)
+
+.PHONY: dbt-freshness
+dbt-freshness: ## Exit non-zero if silver has no rows newer than the source SLA
+	$(DBT) source freshness
 
 .PHONY: dbt-docs
-dbt-docs: ## Generate dbt docs (output is gitignored)
+dbt-docs: ## Generate the dbt docs site into dbt/target (gitignored)
 	$(DBT) docs generate
 
 # --------------------------------------------------------------- orchestration

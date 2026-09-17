@@ -1,0 +1,70 @@
+version: 2
+
+sources:
+  - name: silver
+    description: >
+      The deduplicated tables Spark's streaming jobs write. dbt reads them and
+      never writes to them: the boundary between the streaming layer and the
+      transform layer is that dbt owns exactly one namespace, `gold`, and
+      everything upstream of it is owned by the code in `src/wikistream`.
+    database: "{{ env_var('WS_ICEBERG_CATALOG_NAME', 'lakehouse') }}"
+    schema: "{{ env_var('WS_SILVER_NAMESPACE', 'silver') }}"
+
+    tables:
+      - name: edits
+        description: >
+          One row per source event, keyed on `event_id`. Iceberg has no primary
+          key constraint, so that uniqueness is a property of the MERGE that
+          writes the table rather than something the catalog enforces — see
+          docs/correctness.md and `make verify-no-duplicates`.
+        # `dbt source freshness` compares max(ingested_at) against these
+        # thresholds. Deliberately generous relative to the 30-second micro-batch
+        # trigger: a stale source here means the streaming job is not running,
+        # which is a different failure from the job running slowly, and 15
+        # minutes is long enough that a laptop being closed for a coffee does not
+        # register as an incident.
+        loaded_at_field: ingested_at
+        freshness:
+          warn_after: { count: 15, period: minute }
+          error_after: { count: 60, period: minute }
+        columns:
+          - name: event_id
+            description: "`meta.id` from the source envelope. A UUID, unique per event."
+            data_tests:
+              - unique
+              - not_null
+          - name: event_time
+            description: "`meta.dt`, when the edit happened. Not when it was ingested."
+            data_tests:
+              - not_null
+          - name: domain
+            description: >
+              The wiki's host. Non-null by validation rule, and the value
+              `canary` marks a synthetic heartbeat rather than a real edit.
+            data_tests:
+              - not_null
+
+      - name: quarantine
+        description: >
+          Events that failed a validation rule, with the reason and the raw
+          frame. Empty is the expected state; a non-empty quarantine is a
+          signal, not a failure of the pipeline.
+        columns:
+          - name: failure_reason
+            description: "Which rule rejected the event, from `wikistream.quality.expectations`."
+            data_tests:
+              - not_null
+              - accepted_values:
+                  arguments:
+                    # The closed list from FAILURE_REASONS. A new rule added in
+                    # Python without being added here fails this test, which is the
+                    # point: the analytics layer has a stake in that vocabulary
+                    # because `mart_pipeline_health` groups by it.
+                    values:
+                      - payload_not_json
+                      - event_id_missing
+                      - event_time_missing
+                      - event_time_unparseable
+                      - domain_missing
+                      - event_time_before_wikipedia
+                      - event_time_in_future

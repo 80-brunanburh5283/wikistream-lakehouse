@@ -1,0 +1,128 @@
+version: 2
+
+models:
+  - name: stg_edits
+    description: >
+      A view over `silver.edits`: the column contract for everything downstream,
+      plus the two time buckets every mart groups by and the `is_canary` flag.
+      Materialised as a Trino view rather than a table so there is exactly one
+      copy of the data — a table here would double the storage to save a
+      `date_trunc` on a query that already scans Parquet.
+
+      The tests here cover only what this model adds. Uniqueness of `event_id` and
+      non-nullness of `event_time` and `domain` are asserted once, on the source in
+      `_silver__sources.yml`, because that is the boundary where Spark's MERGE makes
+      the promise. Repeating them here would run the same 800k-row aggregation twice
+      per `dbt test` and prove the same thing.
+    columns:
+      - name: event_id
+        description: >
+          Unique per event. Uniqueness comes from the MERGE upstream, not from a
+          constraint, and is tested on the source rather than here.
+      - name: event_time
+        description: "When the edit happened, from `meta.dt`. UTC. Not-null tested on the source."
+      - name: event_minute
+        description: "`event_time` truncated to the minute. The grain of `mart_edits_per_minute`."
+        data_tests:
+          - not_null
+      - name: event_hour
+        description: "`event_time` truncated to the hour. The grain of the three hourly marts."
+        data_tests:
+          - not_null
+      - name: event_date
+        description: "Iceberg partition column on the silver table, derived from event time."
+        data_tests:
+          - not_null
+      - name: is_canary
+        description: >
+          True for Wikimedia's synthetic heartbeat events (`domain = 'canary'`).
+          These carry no wiki, page or editor. Marts about editing activity
+          exclude them; `mart_pipeline_health` counts them as a liveness signal.
+        data_tests:
+          - not_null
+      - name: wiki
+        description: "Wiki database name, e.g. `enwiki`. Null only on canary events."
+      - name: domain
+        description: >
+          The wiki's host, e.g. `en.wikipedia.org`. Also the Kafka partition key,
+          which is why it is never null — a null key would break partitioning before
+          it reached here. Not-null tested on the source.
+      - name: change_type
+        description: >
+          What the event describes. `categorize` is the most common value by a
+          wide margin — a category membership change, not an article edit — which
+          is why the marts split on it rather than treating every row as an edit.
+        data_tests:
+          - accepted_values:
+              arguments:
+                # Null on canary events, which `accepted_values` ignores: its
+                # generated predicate is `not in (...)`, and `null not in (...)` is
+                # null, not true. The `not_null` coverage for this column is the
+                # singular test tests/assert_change_type_null_only_on_canary.sql,
+                # which is the assertion actually worth making.
+                values: [edit, new, log, categorize]
+      - name: namespace_id
+        description: "MediaWiki namespace. 0 is article space."
+      - name: is_article
+        description: "`namespace_id = 0`. Null only on canary events."
+      - name: page_title
+        description: "Page title as displayed. Null only on canary events."
+      - name: page_url
+        description: "Canonical URL of the page. Null on canary events and on some log events."
+      - name: editor
+        description: >
+          Username, IP address, or temporary-account name. Null on canary events,
+          and on the small number of events whose author MediaWiki has
+          suppressed — 9 in 858,533 on the sample this was written against.
+      - name: is_bot
+        description: "Whether the source flagged the editor as a bot. Null only on canary events."
+      - name: is_minor
+        description: "Whether the editor marked the change as minor."
+      - name: is_anonymous
+        description: "Derived upstream: the editor is an IP or a MediaWiki temporary account."
+      - name: bytes_old
+        description: "Page size before the change, in bytes. Null where the source omits it."
+      - name: bytes_new
+        description: "Page size after the change, in bytes. Null where the source omits it."
+      - name: bytes_delta
+        description: >
+          `bytes_new - bytes_old`, null-safe upstream. Null for 58% of rows on
+          the sample this was written against, because `categorize` and `log`
+          events carry no length at all. Marts sum `coalesce(bytes_delta, 0)`
+          and count the rows separately, so a null is never silently a zero.
+      - name: late_by_seconds
+        description: >
+          `ingested_at - event_time`. Lateness as a measured column rather than
+          an assumption — see docs/latency.md for the distribution.
+        data_tests:
+          - not_null
+      - name: ingested_at
+        description: "When the Spark batch that wrote this row ran. UTC."
+        data_tests:
+          - not_null
+
+  - name: stg_quarantine
+    description: >
+      A view over `silver.quarantine` without the raw payload. Expected to be
+      empty: on the sample this was written against it has never received a row.
+    columns:
+      - name: failure_reason
+        description: "Which validation rule rejected the event."
+        data_tests:
+          - not_null
+      - name: kafka_partition
+        description: "With `kafka_offset`, the MERGE key for this table."
+        data_tests:
+          - not_null
+      - name: kafka_offset
+        description: "Unique within a partition and never null, which is why it is the key."
+        data_tests:
+          - not_null
+      - name: failed_at
+        description: "Ingest time of the batch that rejected the event. Not event time."
+        data_tests:
+          - not_null
+      - name: failed_hour
+        description: "`failed_at` truncated to the hour. The grain the health mart joins on."
+        data_tests:
+          - not_null

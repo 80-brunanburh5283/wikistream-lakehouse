@@ -280,7 +280,11 @@ services:
   trino:
     image: trinodb/trino:483
     container_name: wikistream-trino
-    profiles: ["full"]
+    # Two profiles, because `docker compose run dbt` enables the dbt service's own
+    # profiles and nothing else — a dependency sitting in a profile that is not
+    # enabled fails with "no such service: trino" rather than being started. So
+    # trino is reachable from both `make up` and `make dbt-run`.
+    profiles: ["full", "dbt"]
     logging: *logging
     depends_on:
       iceberg-rest:

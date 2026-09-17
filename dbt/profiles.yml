@@ -1,0 +1,39 @@
+#  Committed, and safe to commit, because there is nothing in it but environment
+#  variable names. The Trino connection needs no password: the coordinator runs
+#  with authentication disabled on a loopback-bound container, which is the right
+#  configuration for a local development stack and the wrong one for anything
+#  else — see SECURITY.md.
+#
+#  The defaults are the host-facing ones (`localhost:8080`) so that `uv run dbt
+#  run` works from a shell in this directory with no environment at all. The dbt
+#  container overrides WS_TRINO_HOST to `trino`, because inside the compose
+#  network `localhost` is the dbt container itself.
+
+wikistream:
+  target: "{{ env_var('WS_DBT_TARGET', 'dev') }}"
+  outputs:
+    dev:
+      type: trino
+      method: none
+      host: "{{ env_var('WS_TRINO_HOST', 'localhost') }}"
+      port: "{{ env_var('WS_TRINO_PORT', '8080') | int }}"
+      http_scheme: http
+      user: "{{ env_var('WS_TRINO_USER', 'wikistream') }}"
+      # `catalog` is dbt-trino's alias for `database`; spelling it the Trino way
+      # keeps the profile readable next to docker/trino/catalog/lakehouse.properties.
+      catalog: "{{ env_var('WS_ICEBERG_CATALOG_NAME', 'lakehouse') }}"
+      schema: "{{ env_var('WS_GOLD_NAMESPACE', 'gold') }}"
+      # Four, matching the machine this was developed on and the Trino heap it is
+      # given. The DAG is six nodes wide at most, so more threads buy nothing and
+      # a laptop-sized heap makes concurrent writes to the same Iceberg table
+      # commit-conflict for no gain.
+      threads: 4
+      # Every timestamp in this project is UTC — the source emits UTC, Spark's
+      # session zone is UTC, Iceberg stores UTC. A dbt session in the host's zone
+      # would shift `date_trunc('hour', event_time)` for readers outside it, and
+      # nothing would fail; the marts would just be wrong by an offset.
+      timezone: UTC
+      # dbt-trino defaults to prepared statements, which the Iceberg connector
+      # handles fine. Named here because it changes how failures are reported:
+      # with it on, a syntax error names the statement rather than the query.
+      prepared_statements_enabled: true
