@@ -21,12 +21,11 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import uuid
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from stack import REPO_ROOT, SPARK_SQL_SCRIPT, compose, query, spark_submit
 
 from wikistream.config import Settings
 from wikistream.producer.kafka_sink import KafkaSink
@@ -37,67 +36,7 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.integration
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = REPO_ROOT / "tests" / "fixtures" / "recentchange_sample.jsonl"
-
-#: Long enough for a cold JVM start plus a micro-batch on a loaded laptop. A
-#: streaming job that has not finished a bounded run in five minutes is broken,
-#: not slow.
-SUBMIT_TIMEOUT_SECONDS = 300
-
-
-def _compose(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
-    """Run a `docker compose` command from the repository root."""
-    # Fixed argv, no shell, `docker` resolved from PATH.
-    return subprocess.run(
-        ["docker", "compose", *args],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-
-
-def _spark_submit(
-    script: str,
-    *script_args: str,
-    env: dict[str, str],
-    timeout: int = SUBMIT_TIMEOUT_SECONDS,
-) -> subprocess.CompletedProcess[str]:
-    """Run a script in the Spark container with `WS_*` overrides for this test run."""
-    env_flags = [flag for key, value in env.items() for flag in ("-e", f"{key}={value}")]
-    result = _compose(
-        "exec",
-        "-T",
-        *env_flags,
-        "spark",
-        "/opt/spark/bin/spark-submit",
-        script,
-        *script_args,
-        timeout=timeout,
-    )
-    if result.returncode != 0:
-        # The tail, not the whole log: a Spark failure puts the useful lines last
-        # and the first two hundred are class loading.
-        tail = "\n".join(result.stdout.strip().splitlines()[-40:])
-        pytest.fail(f"{script} exited {result.returncode}\n{tail}")
-    return result
-
-
-def _query(sql: str, env: dict[str, str]) -> list[dict[str, Any]]:
-    """Run one statement in the container and parse the JSON rows it prints.
-
-    Every line that starts with `{` is a row: `spark-submit` merges the Python
-    process's stderr into stdout, so filtering by stream is not possible. See the
-    docstring of `scripts/spark_sql.py`.
-    """
-    result = _spark_submit("/opt/wikistream/scripts/spark_sql.py", "--json", sql, env=env)
-    return [
-        json.loads(line)
-        for line in result.stdout.splitlines()
-        if line.startswith("{") and line.rstrip().endswith("}")
-    ]
 
 
 @pytest.fixture(scope="module")
@@ -156,15 +95,15 @@ def ingested(raw_frames: list[str]) -> Iterator[dict[str, Any]]:
         assert sink.stats.delivered == len(raw_frames)
         sink.close()
 
-        _spark_submit("/opt/wikistream/scripts/init_tables.py", env=env)
-        _spark_submit(
+        spark_submit("/opt/wikistream/scripts/init_tables.py", env=env)
+        spark_submit(
             "/opt/wikistream/src/wikistream/streaming/bronze.py",
             "--once",
             env=env,
         )
         yield {"env": env, "table": table, "topic": topic, "namespace": namespace}
     finally:
-        _compose(
+        compose(
             "exec",
             "-T",
             *[f for k, v in env.items() for f in ("-e", f"{k}={v}")],
@@ -173,11 +112,9 @@ def ingested(raw_frames: list[str]) -> Iterator[dict[str, Any]]:
             "-lc",
             f"rm -rf {env['WS_CHECKPOINT_ROOT']}",
         )
-        _spark_submit(
-            "/opt/wikistream/scripts/spark_sql.py", f"DROP TABLE IF EXISTS {table} PURGE", env=env
-        )
-        _spark_submit(
-            "/opt/wikistream/scripts/spark_sql.py",
+        spark_submit(SPARK_SQL_SCRIPT, f"DROP TABLE IF EXISTS {table} PURGE", env=env)
+        spark_submit(
+            SPARK_SQL_SCRIPT,
             f"DROP NAMESPACE IF EXISTS {settings.iceberg_catalog_name}.{namespace}",
             env=env,
         )
@@ -194,7 +131,7 @@ def test_every_produced_frame_lands_exactly_once(
     committed the same records under two batches — the exact failure that
     checkpointing plus Iceberg's per-epoch commit is supposed to prevent.
     """
-    rows = _query(
+    rows = query(
         f"""SELECT count(*) AS rows,
                    count(DISTINCT kafka_partition || ':' || kafka_offset) AS coords,
                    count(DISTINCT event_id) AS ids
@@ -211,7 +148,7 @@ def test_raw_payload_is_byte_exact(ingested: dict[str, Any], raw_frames: list[st
     a re-serialised payload is a different artefact that merely happens to mean the
     same thing.
     """
-    landed = _query(f"SELECT raw_payload FROM {ingested['table']}", ingested["env"])
+    landed = query(f"SELECT raw_payload FROM {ingested['table']}", ingested["env"])
     payloads = [row["raw_payload"] for row in landed]
 
     assert sorted(payloads) == sorted(raw_frames)
@@ -224,7 +161,7 @@ def test_extracted_columns_match_the_payload(ingested: dict[str, Any]) -> None:
     would catch a future change that extracted the wrong field just as well as one
     that dropped it.
     """
-    rows = _query(
+    rows = query(
         f"""SELECT
               count_if(event_id <> get_json_object(raw_payload, '$.meta.id')) AS wrong_id,
               count_if(schema_uri <> get_json_object(raw_payload, '$."$schema"')) AS wrong_schema,
@@ -244,7 +181,7 @@ def test_kafka_coordinates_and_ingest_metadata_are_populated(ingested: dict[str,
     Iceberg's null partition and the table would have one growing partition rather
     than one per day.
     """
-    rows = _query(
+    rows = query(
         f"""SELECT count(DISTINCT kafka_topic) AS topics,
                    count(DISTINCT kafka_partition) AS partitions,
                    count_if(kafka_timestamp IS NULL) AS null_broker_time,
@@ -276,7 +213,7 @@ def test_the_batch_is_recorded_as_one_iceberg_snapshot(ingested: dict[str, Any])
     committed, which is what makes a replayed batch a no-op instead of a duplicate.
     A test that only counted rows would not notice if that tag disappeared.
     """
-    snapshots = _query(
+    snapshots = query(
         f"""SELECT summary['added-records'] AS added,
                    summary['spark.sql.streaming.epochId'] AS epoch
             FROM {ingested["table"]}.snapshots
@@ -295,13 +232,13 @@ def test_rerunning_the_job_adds_nothing(ingested: dict[str, Any], raw_frames: li
     checkpoint were being ignored — a renamed query, a deleted directory, an
     `earliest` that applied on every start — this would double the table.
     """
-    _spark_submit(
+    spark_submit(
         "/opt/wikistream/src/wikistream/streaming/bronze.py", "--once", env=ingested["env"]
     )
-    rows = _query(f"SELECT count(*) AS rows FROM {ingested['table']}", ingested["env"])
+    rows = query(f"SELECT count(*) AS rows FROM {ingested['table']}", ingested["env"])
     assert rows == [{"rows": len(raw_frames)}]
 
     # An empty batch must not leave a snapshot behind either: an Iceberg commit per
     # idle trigger would grow the metadata forever on a quiet topic.
-    snapshots = _query(f"SELECT count(*) AS n FROM {ingested['table']}.snapshots", ingested["env"])
+    snapshots = query(f"SELECT count(*) AS n FROM {ingested['table']}.snapshots", ingested["env"])
     assert snapshots == [{"n": 1}]

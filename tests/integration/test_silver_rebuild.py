@@ -26,13 +26,12 @@ from __future__ import annotations
 
 import json
 import shutil
-import subprocess
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from stack import REPO_ROOT, SPARK_SQL_SCRIPT, compose, query, spark_submit
 
 from wikistream.config import Settings
 from wikistream.producer.kafka_sink import KafkaSink
@@ -40,16 +39,12 @@ from wikistream.sources.base import SourceEvent
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
 pytestmark = pytest.mark.integration
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
 SAMPLE = REPO_ROOT / "tests" / "fixtures" / "recentchange_sample.jsonl"
 ADVERSARIAL = REPO_ROOT / "tests" / "fixtures" / "adversarial.jsonl"
-
-#: Long enough for a cold JVM start plus a micro-batch on a loaded laptop. A bounded
-#: streaming run that has not finished in five minutes is broken, not slow.
-SUBMIT_TIMEOUT_SECONDS = 300
 
 #: The adversarial frames that must be rejected, and by which rule. Kept here rather
 #: than derived from `wikistream.quality.expectations` on purpose: deriving it would
@@ -61,60 +56,6 @@ EXPECTED_QUARANTINE = {
     "Adversarial:missing_meta_domain": "domain_missing",
     "Adversarial:far_future_meta_dt": "event_time_in_future",
 }
-
-
-def _compose(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
-    """Run a `docker compose` command from the repository root."""
-    # Fixed argv, no shell, `docker` resolved from PATH.
-    return subprocess.run(
-        ["docker", "compose", *args],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-
-
-def _spark_submit(
-    script: str,
-    *script_args: str,
-    env: dict[str, str],
-    timeout: int = SUBMIT_TIMEOUT_SECONDS,
-    check: bool = True,
-) -> subprocess.CompletedProcess[str]:
-    """Run a script in the Spark container with `WS_*` overrides for this test run.
-
-    `check=False` is for the scripts whose exit code is the thing under test —
-    `verify_no_duplicates.py` is supposed to be able to fail.
-    """
-    env_flags = [flag for key, value in env.items() for flag in ("-e", f"{key}={value}")]
-    result = _compose(
-        "exec",
-        "-T",
-        *env_flags,
-        "spark",
-        "/opt/spark/bin/spark-submit",
-        script,
-        *script_args,
-        timeout=timeout,
-    )
-    if check and result.returncode != 0:
-        # The tail, not the whole log: a Spark failure puts the useful lines last and
-        # the first two hundred are class loading.
-        tail = "\n".join(result.stdout.strip().splitlines()[-40:])
-        pytest.fail(f"{script} exited {result.returncode}\n{tail}")
-    return result
-
-
-def _query(sql: str, env: dict[str, str]) -> list[dict[str, Any]]:
-    """Run one statement in the container and parse the JSON rows it prints."""
-    result = _spark_submit("/opt/wikistream/scripts/spark_sql.py", "--json", sql, env=env)
-    return [
-        json.loads(line)
-        for line in result.stdout.splitlines()
-        if line.startswith("{") and line.rstrip().endswith("}")
-    ]
 
 
 def _frames(path: Path) -> list[str]:
@@ -167,11 +108,11 @@ def merged() -> Iterator[dict[str, Any]]:
         assert remaining == 0, f"{remaining} records never reached the broker"
         sink.close()
 
-        _spark_submit("/opt/wikistream/scripts/init_tables.py", env=env)
-        _spark_submit("/opt/wikistream/src/wikistream/streaming/bronze.py", "--once", env=env)
-        _spark_submit("/opt/wikistream/src/wikistream/streaming/silver.py", "--once", env=env)
+        spark_submit("/opt/wikistream/scripts/init_tables.py", env=env)
+        spark_submit("/opt/wikistream/src/wikistream/streaming/bronze.py", "--once", env=env)
+        spark_submit("/opt/wikistream/src/wikistream/streaming/silver.py", "--once", env=env)
 
-        window = _query(
+        window = query(
             "SELECT cast(min(ingest_date) AS string) AS first_day, "
             f"cast(max(ingest_date) AS string) AS last_day FROM {settings.bronze_raw_table}",
             env,
@@ -191,20 +132,20 @@ def merged() -> Iterator[dict[str, Any]]:
             settings.silver_quarantine_table,
             settings.bronze_raw_table,
         ):
-            _spark_submit(
-                "/opt/wikistream/scripts/spark_sql.py",
+            spark_submit(
+                SPARK_SQL_SCRIPT,
                 f"DROP TABLE IF EXISTS {table} PURGE",
                 env=env,
                 check=False,
             )
         for namespace in (bronze_ns, silver_ns):
-            _spark_submit(
-                "/opt/wikistream/scripts/spark_sql.py",
+            spark_submit(
+                SPARK_SQL_SCRIPT,
                 f"DROP NAMESPACE IF EXISTS {settings.iceberg_catalog_name}.{namespace}",
                 env=env,
                 check=False,
             )
-        _compose(
+        compose(
             "exec",
             "-T",
             "spark",
@@ -217,7 +158,7 @@ def merged() -> Iterator[dict[str, Any]]:
 
 def _counts(merged: dict[str, Any]) -> dict[str, int]:
     """Row counts for all three tables, in one round trip."""
-    row = _query(
+    row = query(
         f"""SELECT (SELECT count(*) FROM {merged["bronze"]}) AS bronze,
                    (SELECT count(*) FROM {merged["edits"]}) AS edits,
                    (SELECT count(*) FROM {merged["quarantine"]}) AS quarantine""",
@@ -239,7 +180,7 @@ def _epoch_seconds(rendered: str) -> int:
 
 def _current_snapshot(table: str, env: dict[str, str]) -> int:
     """The snapshot a rollback should return `table` to."""
-    rows = _query(
+    rows = query(
         f"SELECT snapshot_id FROM {table}.snapshots ORDER BY committed_at DESC LIMIT 1", env
     )
     return int(rows[0]["snapshot_id"])
@@ -254,8 +195,8 @@ def _rollback(table: str, snapshot_id: int, env: dict[str, str]) -> None:
     below independent of the ones above.
     """
     catalog, _, relative = table.partition(".")
-    _spark_submit(
-        "/opt/wikistream/scripts/spark_sql.py",
+    spark_submit(
+        SPARK_SQL_SCRIPT,
         f"CALL {catalog}.system.rollback_to_snapshot("
         f"table => '{relative}', snapshot_id => {snapshot_id})",
         env=env,
@@ -274,7 +215,7 @@ def test_every_frame_reached_bronze(merged: dict[str, Any]) -> None:
 
 def test_silver_holds_no_duplicate_event_id(merged: dict[str, Any]) -> None:
     """The invariant, asserted against the table rather than against the statement text."""
-    rows = _query(
+    rows = query(
         f"""SELECT count(*) AS rows,
                    count(DISTINCT event_id) AS ids,
                    count_if(event_id IS NULL) AS null_ids
@@ -293,7 +234,7 @@ def test_bronze_kept_the_duplicates_that_silver_collapsed(merged: dict[str, Any]
     a producer replay after a partial send would. Bronze is the audit log and keeps all
     four; silver keeps one row per id.
     """
-    rows = _query(
+    rows = query(
         f"""SELECT
               (SELECT count(*) FROM {merged["bronze"]}
                 WHERE get_json_object(raw_payload, '$.title') IN
@@ -317,7 +258,7 @@ def test_the_earlier_offset_won_the_divergent_pair(merged: dict[str, Any]) -> No
     Determinism here is what makes the rebuild reproducible: a replay of the same
     offsets has to produce the same table.
     """
-    rows = _query(
+    rows = query(
         f"""SELECT bytes_new FROM {merged["edits"]}
             WHERE page_title = 'Adversarial:divergent_duplicate'""",
         merged["env"],
@@ -332,7 +273,7 @@ def test_each_invalid_frame_landed_in_quarantine_with_its_reason(merged: dict[st
     changed. `raw_payload` is queried for the title because a quarantined row may have
     no usable columns at all — which is the whole reason the payload is stored.
     """
-    rows = _query(
+    rows = query(
         f"""SELECT get_json_object(raw_payload, '$.title') AS title,
                    failure_reason
             FROM {merged["quarantine"]}""",
@@ -349,7 +290,7 @@ def test_quarantined_rows_carry_their_kafka_coordinates(merged: dict[str, Any]) 
     `event_id` is null for some of these rows by definition; the coordinates are what
     make them addressable, and a replay after a fix needs them.
     """
-    rows = _query(
+    rows = query(
         f"""SELECT count(*) AS rows,
                    count(DISTINCT kafka_partition || ':' || kafka_offset) AS coords,
                    count_if(kafka_offset IS NULL OR kafka_partition IS NULL) AS null_coords,
@@ -387,7 +328,7 @@ def test_the_duplicate_gate_exits_zero(merged: dict[str, Any]) -> None:
     Run as a subprocess rather than by importing it, because the exit code is the
     product: `make up` and CI both depend on this failing loudly when it should.
     """
-    result = _spark_submit(
+    result = spark_submit(
         "/opt/wikistream/scripts/verify_no_duplicates.py", env=merged["env"], check=False
     )
 
@@ -406,13 +347,13 @@ def test_the_gate_fails_when_a_duplicate_is_inserted(merged: dict[str, Any]) -> 
     edits, env = merged["edits"], merged["env"]
     clean = _current_snapshot(edits, env)
     try:
-        _spark_submit(
-            "/opt/wikistream/scripts/spark_sql.py",
+        spark_submit(
+            SPARK_SQL_SCRIPT,
             f"""INSERT INTO {edits}
                 SELECT * FROM {edits} WHERE event_id IS NOT NULL ORDER BY event_id LIMIT 1""",
             env=env,
         )
-        result = _spark_submit(
+        result = spark_submit(
             "/opt/wikistream/scripts/verify_no_duplicates.py", env=env, check=False
         )
 
@@ -422,7 +363,7 @@ def test_the_gate_fails_when_a_duplicate_is_inserted(merged: dict[str, Any]) -> 
         _rollback(edits, clean, env)
 
     assert (
-        _spark_submit(
+        spark_submit(
             "/opt/wikistream/scripts/verify_no_duplicates.py", env=env, check=False
         ).returncode
         == 0
@@ -456,19 +397,19 @@ def test_a_rebuild_replaces_a_row_deleted_by_mistake(merged: dict[str, Any]) -> 
     passes: see `ARRIVAL_DEPENDENT_COLUMNS`.
     """
     edits, env, window = merged["edits"], merged["env"], merged["window"]
-    victim = _query(
+    victim = query(
         f"SELECT * FROM {edits} WHERE event_id IS NOT NULL ORDER BY event_id LIMIT 1", env
     )[0]
     before = _counts(merged)
 
-    _spark_submit(
-        "/opt/wikistream/scripts/spark_sql.py",
+    spark_submit(
+        SPARK_SQL_SCRIPT,
         f"DELETE FROM {edits} WHERE event_id = '{victim['event_id']}'",
         env=env,
     )
     assert _counts(merged)["edits"] == before["edits"] - 1, "the delete did not remove one row"
 
-    _spark_submit(
+    spark_submit(
         "/opt/wikistream/scripts/rebuild_silver.py",
         "--from",
         window["first_day"],
@@ -477,7 +418,7 @@ def test_a_rebuild_replaces_a_row_deleted_by_mistake(merged: dict[str, Any]) -> 
         env=env,
     )
 
-    restored = _query(f"SELECT * FROM {edits} WHERE event_id = '{victim['event_id']}'", env)
+    restored = query(f"SELECT * FROM {edits} WHERE event_id = '{victim['event_id']}'", env)
     assert len(restored) == 1, "the rebuild did not restore exactly one row"
     assert _counts(merged) == before
 
@@ -509,7 +450,7 @@ def test_replaying_the_same_window_twice_changes_nothing(merged: dict[str, Any])
     before = _counts(merged)
 
     for _ in range(2):
-        _spark_submit(
+        spark_submit(
             "/opt/wikistream/scripts/rebuild_silver.py",
             "--from",
             window["first_day"],
@@ -523,7 +464,7 @@ def test_replaying_the_same_window_twice_changes_nothing(merged: dict[str, Any])
 
 def test_the_gate_still_passes_after_the_replays(merged: dict[str, Any]) -> None:
     """The same data through the same MERGE four times over, and still one row per event."""
-    result = _spark_submit(
+    result = spark_submit(
         "/opt/wikistream/scripts/verify_no_duplicates.py", env=merged["env"], check=False
     )
 
@@ -541,7 +482,7 @@ def test_maintenance_preserves_every_row(merged: dict[str, Any]) -> None:
     """
     before = _counts(merged)
 
-    result = _spark_submit(
+    result = spark_submit(
         "/opt/wikistream/scripts/maintain_tables.py", env=merged["env"], check=False
     )
 
