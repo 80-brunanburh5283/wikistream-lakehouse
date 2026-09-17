@@ -1,0 +1,49 @@
+# The one hole the base policies do not have.
+#
+# base/networkpolicy.yaml allows egress to the namespace and to DNS, and nothing
+# else, which is enough for the local overlay: Postgres, Trino and Kafka all live in
+# there. On a real cluster two of those move out. Postgres becomes RDS and Kafka
+# becomes MSK, both reachable by address rather than by pod selector, and a
+# NetworkPolicy cannot select on something that is not a pod — so this is a CIDR
+# rule, which is the least precise kind and the only kind available.
+#
+# 10.0.0.0/8 is the VPC's supernet rather than the broker's address, because MSK
+# replaces its broker ENIs during a patch and their addresses change.
+#
+# There is no `except:` block, and that is worth a sentence because the shape most
+# examples use is `cidr: 0.0.0.0/0` with `except: [169.254.169.254/32]` to block the
+# instance metadata service — the one address in a VPC that hands out credentials to
+# whatever asks. That shape is strictly worse than this one: it opens the internet
+# in order to close one address. Here the metadata service is outside the allowed
+# CIDR already, along with everything else that is not the VPC, so it is denied by
+# the rule not existing. An `except` that is not inside its own `cidr` is also
+# rejected by the API server, which is how a reader can check this claim.
+#
+# This rule and the security groups in infra/aws/modules/network/main.tf are the
+# same decision at two layers, and both are needed: a security group cannot see a
+# pod, and a NetworkPolicy cannot be enforced by a CNI that does not implement one.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-to-managed-services
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: dagster
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+      ports:
+        # MSK with SASL/IAM. The same port modules/network opens for the Spark
+        # workers, for the same client library reading the same topic's watermarks.
+        - protocol: TCP
+          port: 9098
+        # RDS for Postgres.
+        - protocol: TCP
+          port: 5432
+        # Trino's coordinator, wherever the cluster runs it.
+        - protocol: TCP
+          port: 8080

@@ -1,0 +1,65 @@
+#  The Dagster instance, for a cluster rather than for Compose.
+#
+#  This file and docker/dagster/dagster.yaml configure the same two processes and
+#  differ in exactly one substantive way, which is the interesting part of this
+#  whole directory: **storage is Postgres here and SQLite there.**
+#
+#  DECISIONS.md ADR-0033 chose SQLite for Compose and named the condition that
+#  would reverse it — more than one process needing the run store from more than
+#  one filesystem. Kubernetes is that condition. The webserver and the daemon are
+#  separate pods, so they cannot share a file; a ReadWriteMany volume would let
+#  them try, and SQLite over NFS is a locking bug with a delay fuse. Postgres is
+#  also what makes the webserver horizontally scalable, which overlays/prod uses.
+#
+#  All four connection fields are read from the environment, and they arrive from
+#  two different places on purpose: the host, database and username come from the
+#  `wikistream-endpoints` ConfigMap an overlay supplies, and `DAGSTER_PG_PASSWORD`
+#  comes from a Secret this repository neither contains nor generates. Putting the
+#  hostname in the Secret too is the more common shape and it is worse — it makes
+#  the one object nobody can read the one object that says which database this is.
+#  k8s/README.md has the command that creates it. There is no default, so a missing
+#  Secret is a pod that will not start rather than a pod that starts and connects
+#  to something it should not.
+
+telemetry:
+  # Same decision as the Compose instance: the README says which endpoints this
+  # project talks to, and a usage ping would make that list wrong.
+  enabled: false
+
+storage:
+  postgres:
+    postgres_db:
+      username:
+        env: DAGSTER_PG_USERNAME
+      password:
+        env: DAGSTER_PG_PASSWORD
+      hostname:
+        env: DAGSTER_PG_HOST
+      db_name:
+        env: DAGSTER_PG_DB
+      port: 5432
+
+concurrency:
+  runs:
+    # Still one, and still for Trino's sake rather than Dagster's. The queue is a
+    # property of the pipeline downstream of this deployment, not of the machine
+    # it runs on, so moving to a cluster does not raise it. What would raise it is
+    # a Trino coordinator with more than 2 GB of heap.
+    max_concurrent_runs: 1
+
+run_monitoring:
+  # Worth more here than in Compose, not less. Runs execute as subprocesses of
+  # these pods, so an evicted or OOM-killed pod takes its in-flight runs with it
+  # and none of them writes a failure event. Without monitoring those runs stay
+  # STARTED for ever and the queue fills with corpses.
+  enabled: true
+  start_timeout_seconds: 300
+  poll_interval_seconds: 30
+
+retention:
+  # Postgres does not grow a file on someone's laptop, but 22,000 successful ticks
+  # a month is still 22,000 rows a month nobody will read.
+  schedule:
+    purge_after_days: 7
+  sensor:
+    purge_after_days: 7

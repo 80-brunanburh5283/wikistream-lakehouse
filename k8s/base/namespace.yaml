@@ -1,0 +1,16 @@
+# The namespace is in the base rather than left to the operator because the
+# NetworkPolicy in this directory selects on it, and a policy that lands in the
+# wrong namespace is a policy that permits everything while appearing to exist.
+#
+# The two `pod-security.kubernetes.io` labels are the enforcement half of the
+# securityContext blocks on the deployments. Without them a pod that drops its
+# hardening still schedules; with them the API server rejects it. `restricted` is
+# the strictest of the three built-in levels and both pods here already satisfy
+# it: non-root, no privilege escalation, all capabilities dropped, seccomp on.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wikistream
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

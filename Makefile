@@ -347,3 +347,14 @@ infra-scan: ## trivy config over the Terraform. Fails on any finding.
 	  echo "trivy not found. Untar the release binary from"; \
 	  echo "https://github.com/aquasecurity/trivy/releases into ~/.local/bin"; exit 1; }
 	trivy config --quiet --exit-code 1 --disable-telemetry $(TF_DIR)
+
+.PHONY: k8s-validate
+k8s-validate: ## kustomize build + kubeconform -strict on every overlay. No cluster.
+	bash scripts/validate_k8s.sh
+
+.PHONY: build-dagster-k8s
+build-dagster-k8s: ## Build the Dagster image with the dbt project baked in, for k8s/
+	@# Two steps because the second image is built FROM the first. Compose owns the
+	@# base image's build arguments, so it builds that one; this one has none.
+	$(COMPOSE) --profile full build dagster-webserver
+	docker build --file docker/dagster-k8s.Dockerfile --tag wikistream/dagster-k8s:local .

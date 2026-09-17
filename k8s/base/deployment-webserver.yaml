@@ -1,0 +1,138 @@
+# The UI and the GraphQL API.
+#
+# Stateless, because storage is Postgres: any replica can serve any run's event
+# log. That is the property overlays/prod relies on to run two of these, and it is
+# the property SQLite does not have — which is the whole reason this directory has
+# a different dagster.yaml from docker/dagster/.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dagster-webserver
+  labels:
+    app.kubernetes.io/component: webserver
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: webserver
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: webserver
+    spec:
+      serviceAccountName: dagster
+      # 20 s in docker-compose.yml, 30 here: a run executing as a subprocess of
+      # this pod gets the same chance to finish, plus the time an endpoint takes
+      # to leave the Service's list of ready addresses.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # The uid the image's `useradd` created. Stated here as well as in the
+        # Dockerfile because `runAsNonRoot` is checked by the kubelet against this
+        # field, and an image whose USER is a name rather than a number fails that
+        # check with "container has runAsNonRoot and image has non-numeric user".
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: webserver
+          image: wikistream/dagster-k8s:local
+          args:
+            - dagster-webserver
+            - --host
+            - 0.0.0.0
+            - --port
+            - "3000"
+            - -m
+            - wikistream_dagster.definitions
+          ports:
+            - name: http
+              containerPort: 3000
+          envFrom:
+            # Trino, Kafka and the Postgres host, database and user. Supplied by
+            # the overlay, because addresses are the thing that genuinely differs
+            # between a kind cluster and a real one.
+            - configMapRef:
+                name: wikistream-endpoints
+            # DAGSTER_PG_PASSWORD, and nothing else. Not created by these manifests
+            # and not present in this repository; k8s/README.md has the command.
+            # No `optional: true`, so a missing Secret stops the pod instead of
+            # starting one that cannot reach its run store.
+            - secretRef:
+                name: dagster-postgres
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            # The request is what this actually holds when idle; the limit is
+            # headroom for a run executing as a subprocess here, which happens
+            # whenever someone presses Materialize in the UI. A limit equal to the
+            # request would make the UI the least reliable way to launch a job.
+            requests:
+              cpu: 300m
+              memory: 768Mi
+            limits:
+              cpu: "1500m"
+              memory: 2Gi
+          startupProbe:
+            # Importing dagster, dagster-dbt and dbt-core, then parsing the dbt
+            # project in the entrypoint, takes tens of seconds on a cold page
+            # cache. A startup probe is how that is expressed without loosening
+            # the liveness probe afterwards, which is the usual mistake: an
+            # `initialDelaySeconds: 120` liveness probe also gives a wedged
+            # process two minutes of grace for the rest of the pod's life.
+            httpGet:
+              path: /server_info
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /server_info
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /server_info
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: dagster-home
+              mountPath: /opt/dagster/home
+            - name: instance
+              # Nested inside the mount above, which the kubelet handles by
+              # mounting the shorter path first. It has to be this way round:
+              # dagster.yaml is only read from $DAGSTER_HOME, and $DAGSTER_HOME
+              # has to be writable for captured step logs.
+              mountPath: /opt/dagster/home/dagster.yaml
+              subPath: dagster.yaml
+              readOnly: true
+            - name: scratch
+              mountPath: /tmp
+      volumes:
+        - name: dagster-home
+          # emptyDir, not a PVC, and the run store is not in here — Postgres has
+          # it. What is in here is captured stdout and stderr per step, which the
+          # default compute log manager writes to local disk. Those are lost when
+          # the pod is replaced, which is the one capability this deployment has
+          # less of than the Compose one. k8s/README.md says what fixes it.
+          emptyDir: {}
+        - name: instance
+          configMap:
+            # Rewritten by kustomize to the generated name, which carries a hash
+            # of the file's contents. Editing dagster.yaml therefore changes this
+            # reference, which rolls the pods. A hand-written ConfigMap name would
+            # leave the old config running until someone remembered to restart.
+            name: dagster-instance
+        - name: scratch
+          # Because readOnlyRootFilesystem is true and dbt writes its target
+          # directory and log file under /tmp — see the WS_DBT_TARGET_PATH and
+          # DBT_LOG_PATH values in docker/dagster.Dockerfile.
+          emptyDir: {}

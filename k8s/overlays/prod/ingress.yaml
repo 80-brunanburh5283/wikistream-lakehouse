@@ -1,0 +1,44 @@
+# The Dagster UI, behind TLS.
+#
+# There is no authentication here, and that is the honest and uncomfortable fact
+# about exposing open-source Dagster: the webserver has no login, no users and no
+# authorisation model, so anyone who can reach this URL can launch and cancel every
+# job in the deployment. The annotations below put basic auth in front of it, which
+# is the minimum, and the Secret they name is not in this repository. Real
+# deployments put an identity-aware proxy here — oauth2-proxy, or the cluster's
+# service mesh — and this Ingress is the place that decision gets made.
+#
+# The hostname is a convention rather than a generated identifier, which is why it
+# is in git while the MSK bootstrap address is not. See the header of
+# kustomization.yaml.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: dagster-webserver
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+    nginx.ingress.kubernetes.io/auth-type: basic
+    nginx.ingress.kubernetes.io/auth-secret: dagster-ui-basic-auth
+    nginx.ingress.kubernetes.io/auth-realm: "wikistream Dagster"
+    # Dagster's UI holds a websocket open for live run logs. The default read
+    # timeout closes it after 60 seconds, and the symptom is a UI that shows a run
+    # start and then stops updating — which looks like a stuck run.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - dagster.wikistream.internal
+      secretName: dagster-webserver-tls
+  rules:
+    - host: dagster.wikistream.internal
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: dagster-webserver
+                port:
+                  name: http

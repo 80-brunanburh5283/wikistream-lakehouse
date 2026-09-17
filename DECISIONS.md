@@ -1693,3 +1693,244 @@ launched it — so a run launched from the UI runs in the webserver container an
 scheduled run runs in the daemon container. On one machine that distinction has no
 consequence. On several it would be the first thing to change, and the change is
 `dagster.yaml` plus one Compose service, not a rewrite.
+
+---
+
+## ADR-0034 — Scan the Terraform with Trivy, not tfsec or Checkov
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+`infra/aws/` is never applied, so `terraform validate` is the only correctness check
+it can get from Terraform itself — and validate checks the provider's schema, which
+catches a misspelled attribute and nothing about whether the configuration is safe.
+A static analyser is what turns the module from a plausible-looking artefact into one
+whose claims about least privilege and encryption are checked by something other than
+the person who wrote them.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| tfsec | The obvious choice, and archived. Its last release was 2025-05-02 and its own README points users at Trivy, into which Aqua merged the rule set. Adopting a tool that has stopped shipping means the rule set stops learning about new services, which for infrastructure scanning is the whole value. |
+| Checkov | Actively developed, more rules than Trivy, and a Python package — which is the problem. It is ~100 transitive dependencies into `uv.lock`, in a repository where the lock file is otherwise the pipeline's own dependency graph. A reader running `uv tree` should not have to work out why a data project depends on `boto3`, `cyclonedx-python-lib` and `pycep-parser`. |
+| Trivy | Chosen. |
+
+### Decision
+
+`make infra-scan` runs `trivy config --quiet --exit-code 1 --disable-telemetry
+infra/aws`. A single Go binary, no Python dependencies, and the same rule identifiers
+(`AVD-AWS-####`) the tfsec documentation uses, so a suppression comment written
+against tfsec's docs still means what it says.
+
+`--exit-code 1` is the part that matters: the scan fails the build on any finding at
+any severity, so the only way to pass with a finding is an inline suppression that
+states its reason on the same line. There are two, both in `modules/s3`, both listed
+in `infra/aws/README.md`.
+
+### Consequence
+
+One more non-Python binary a contributor needs, alongside `terraform`,
+`kubeconform` and `kustomize`. The Makefile target prints the release URL rather
+than failing with "command not found", and CI installs it from the vendor's action.
+
+Two consequences that were surprises and are worth recording, because both changed
+the code rather than the tooling:
+
+- **Trivy cannot resolve `for_each`.** The first version of `modules/s3` created the
+  public access blocks, encryption and versioning with one resource each looped over
+  a map of bucket ids. Trivy reported both buckets as having none of the three,
+  because it cannot follow `bucket = each.value` back to the resource it names. The
+  controls are written out per bucket now: six extra lines, and a reviewer can see
+  each control next to the bucket it protects. A control a static analyser cannot see
+  is a control someone has to verify by hand.
+- **A suppression attaches to the resource the rule fires on, not the resource the
+  rule is about.** `AVD-AWS-0132` is "use a customer-managed KMS key", and the
+  comment has to sit above `aws_s3_bucket_server_side_encryption_configuration`,
+  not above the `aws_s3_bucket` it configures. Put it on the bucket and the scan
+  still fails, which reads like a broken suppression syntax.
+
+---
+
+## ADR-0035 — The AWS module consumes a VPC; it does not create one
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+MSK Serverless and EMR Serverless both require private subnets. A module that
+provisions them therefore needs a network, and the default instinct is to create one
+— a VPC, subnets across three availability zones, route tables, and the VPC
+endpoints that let workers reach S3, Glue and STS without a NAT gateway.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Create the VPC, subnets, route tables and endpoints | It doubles the module and it is the part of the module that would be wrong in every real account. Networks are shared, they have an owner who is not this module, and a second VPC in an account is usually a mistake someone has to unpick. It would also mean the module's blast radius includes the network, which is the one resource whose deletion takes everything else with it. |
+| Create the VPC endpoints only, taking the VPC as input | Closer, and still wrong in the same direction: an interface endpoint is an account-level shared resource priced per hour per AZ, and creating a second Glue endpoint next to an existing one is a waste that is invisible until the bill. |
+| Take `vpc_id` and `private_subnet_ids` as required inputs | Chosen. |
+
+### Decision
+
+`vpc_id` and `private_subnet_ids` are required variables with no defaults;
+`private_subnet_ids` validates that at least two were given, because a single-AZ
+deployment of a service billed by cluster-hour is a decision nobody makes on
+purpose. `modules/network` creates two security groups and nothing else.
+
+The endpoints are documented as prerequisites in `infra/aws/README.md` rather than
+created, and the egress rules assume them: there is no `0.0.0.0/0` rule anywhere in
+the module, so a worker's only routes are to MSK inside the VPC, to S3 through the
+gateway endpoint's managed prefix list, and to the VPC's own CIDR on 443 where the
+interface endpoints live.
+
+### Consequence
+
+The module cannot be applied into an empty account, which is honest — it is a
+component, not a landing zone. The failure mode when a prerequisite is missing is
+poor and worth knowing in advance: a Spark job with no route to STS hangs on
+`AssumeRole` and eventually times out, with nothing in the logs that mentions the
+network. `infra/aws/README.md` says so under "What it deliberately does not create".
+
+The gain is that the interesting parts of the module — the IAM policies, the S3
+lifecycle rules, the security group egress — are all things this pipeline actually
+needs, rather than 200 lines of network boilerplate that any account already has.
+
+---
+
+## ADR-0036 — Commit `.terraform.lock.hcl`
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+The first version of `.gitignore` in this repository ignored `.terraform.lock.hcl`
+along with `.terraform/`, `*.tfstate` and `*.tfplan`. Three of those four are
+correct. The lock file is not state and not a plan: it is the provider dependency
+lock, recording each provider's version and the checksums of every platform's
+package.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Keep ignoring it | `terraform init` then resolves `~> 6.65` freshly on every machine, so CI and a contributor can validate against different provider builds, and a provider release between two runs changes the result of `terraform validate` with no commit to explain it. It also gives up the supply-chain property the file exists for: init verifies the downloaded package against a committed hash. |
+| Commit it with only the CI platform's hashes | What `terraform init` writes by default — hashes for the platform that ran it, and nothing else. A contributor on an Apple Silicon laptop then gets a checksum error, and the documented fix is `terraform providers lock`, which changes a committed file as a side effect of doing nothing. |
+| Commit it with hashes for the platforms anyone will use | Chosen. |
+
+### Decision
+
+`.terraform.lock.hcl` is committed, and generated with
+
+```
+terraform providers lock \
+  -platform=linux_amd64 -platform=linux_arm64 -platform=darwin_arm64
+```
+
+so CI, a WSL laptop and an Apple Silicon laptop all verify against the same file.
+`.gitignore` carries a comment saying the omission is deliberate, because the next
+person to tidy that section will otherwise re-add it.
+
+### Consequence
+
+Provider upgrades become explicit: `terraform init -upgrade` changes a committed
+file, which shows up in review as a version bump rather than happening silently
+between two CI runs. The cost is remembering the `-platform` flags when the provider
+is upgraded, which is one line in `infra/aws/README.md`.
+
+---
+
+## ADR-0037 — `k8s/` deploys the control plane only, with the dbt project in the image
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+Two of the three job adverts this repository is written against name Kubernetes and
+GitOps, so `k8s/` exists. The question is what it should contain. The pipeline has six
+components in `docker-compose.yml` — Kafka, MinIO, an Iceberg REST catalog, Spark,
+Trino and Dagster — and charts or operators exist for all of them.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Port the whole stack: Strimzi for Kafka, the Spark operator, a MinIO tenant, the Trino chart, Dagster | Two deployments of the same pipeline, one of which is exercised by every test in this repository and one of which is exercised by nothing. The second would drift from the first, and a reader checking any claim about it would find the drift. It is also several thousand lines to review. |
+| A single Helm chart instead of kustomize overlays | Helm is the more common answer and it is the wrong shape for the point being made. The interesting content here is the difference between a laptop deployment and a cluster deployment; two kustomize overlays *are* that difference, readable as a diff, whereas in a chart it is scattered across `values-*.yaml` and `{{ if }}` blocks. |
+| Only Dagster, as a kustomize base with `local` and `prod` overlays | Chosen. |
+
+### Decision
+
+`k8s/` deploys the Dagster webserver and daemon, and nothing else. The addresses of
+everything they talk to come from a ConfigMap. `k8s/README.md` states in its first
+paragraph that the manifests have never been applied and lists what would have to
+happen before they could be trusted.
+
+The dbt project is baked into the image by `docker/dagster-k8s.Dockerfile` rather
+than mounted. Under Compose it is a read-only bind mount of the working tree, which
+is deliberate — the entrypoint parses the project at start-up, so editing a model
+changes the SQL dbt runs and the graph Dagster displays without a rebuild. A cluster
+has no working tree. The rejected alternatives were an init container cloning this
+repository, which makes every pod start depend on GitHub and needs egress the pod
+otherwise does not have, and a ConfigMap, which cannot hold `models/staging/` at all
+because a ConfigMap key cannot contain a slash.
+
+### Consequence
+
+`k8s/` is about 400 lines including comments, and every line of it is a decision
+rather than boilerplate. The manifests are checked in CI by `kustomize build` and
+`kubeconform -strict`, which prove they are well-formed Kubernetes and prove nothing
+about whether the pods start — stated as the first item on the README's list.
+
+Baking the project in means the image is a single artefact whose models and whose
+asset graph cannot disagree, and that a rollback rolls back both. It also means a
+model change requires an image build for the cluster, which is the normal cost of
+immutability and is why the Compose path keeps the bind mount.
+
+---
+
+## ADR-0038 — Postgres for the Dagster instance on Kubernetes, reversing ADR-0033 there
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+ADR-0033 chose SQLite for the Dagster run and event storage under Compose, and named
+the condition that would reverse it: more than one process needing the run store from
+more than one filesystem. Kubernetes is that condition. The webserver and the daemon
+are separate pods and must share the store — the daemon writes a run, the launcher
+executes it, the webserver reads its events back — and two pods cannot share a file.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Keep SQLite on a `ReadWriteMany` volume | It would appear to work. SQLite's locking depends on filesystem locks that NFS and most RWX CSI drivers implement incompletely, so the failure is a corrupted database days later rather than an error on the first write. This is the option worth naming explicitly because it is the one someone porting the Compose deployment would reach for. |
+| One pod running both processes with a shared `emptyDir` | Honest, and it keeps SQLite. It also merges two lifecycles that should be separate: the daemon must be a singleton and the webserver benefits from replicas, and this option makes replicating the UI impossible. |
+| Postgres, run in the cluster for `local` and managed for `prod` | Chosen. |
+
+### Decision
+
+`k8s/base/dagster.yaml` configures `storage.postgres`, with the host, database and
+username from the `wikistream-endpoints` ConfigMap and the password from a Secret this
+repository does not contain. `overlays/local` runs a single-replica Postgres
+StatefulSet; `overlays/prod` ships no database at all and expects a managed one.
+
+The two `dagster.yaml` files therefore differ in exactly one substantive stanza, and
+both carry a comment saying why the same argument reaches opposite conclusions on the
+two platforms.
+
+### Consequence
+
+Under Kubernetes the deployment gains a database to operate and `overlays/prod` gains
+two webserver replicas, which is what Postgres buys: either replica can serve any
+run's event log because neither owns it. The daemon stays at one replica with
+`strategy: Recreate`, because a rolling update would briefly run two schedulers
+against the same tick table.
+
+The local Postgres pins `PGDATA=/var/lib/postgresql/18/docker` explicitly and mounts
+its volume one level up at `/var/lib/postgresql`. Postgres 18's official image moved
+both, and a manifest that mounts a PVC at the old `/var/lib/postgresql/data`
+initialises the database onto the container filesystem instead: it starts, it passes
+its readiness probe, and it is empty after the first restart.

@@ -55,6 +55,11 @@ crash.log
 *.swp
 .DS_Store
 
+# Downloaded tool caches. `.cache/kubeconform` holds the JSON schemas
+# scripts/validate_k8s.sh fetches on a cold run; they are large, generated, and
+# versioned by the upstream repositories they come from.
+.cache/
+
 # Scratch
 docs/img/*.tmp
 /tmp/

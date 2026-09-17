@@ -1,0 +1,98 @@
+# The scheduler, the sensor loop, the run queue and the run monitor.
+#
+# One replica, and `strategy: Recreate` rather than the default RollingUpdate. That
+# is the least obvious line in this directory and it is a correctness fix, not a
+# preference: a rolling update starts the new daemon before stopping the old one,
+# and for the length of that overlap two schedulers evaluate the same schedules.
+# Dagster guards against duplicate ticks for the same schedule and evaluation time
+# in the tick table, so the visible symptom is not usually two runs — it is tick
+# rows failing to insert and the daemon logging conflicts during every deploy.
+# Recreate costs a few seconds with no daemon, during which nothing fires and
+# nothing is lost, because a missed schedule tick is caught up on the next pass.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dagster-daemon
+  labels:
+    app.kubernetes.io/component: daemon
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: daemon
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: daemon
+    spec:
+      serviceAccountName: dagster
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        runAsNonRoot: true
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: daemon
+          image: wikistream/dagster-k8s:local
+          args:
+            - dagster-daemon
+            - run
+            - -m
+            - wikistream_dagster.definitions
+          envFrom:
+            - configMapRef:
+                name: wikistream-endpoints
+            - secretRef:
+                name: dagster-postgres
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            # Same shape as the webserver and for the same reason: every scheduled
+            # run executes as a subprocess of this pod, and `build_marts` runs dbt.
+            requests:
+              cpu: 300m
+              memory: 768Mi
+            limits:
+              cpu: "1500m"
+              memory: 2Gi
+          startupProbe:
+            exec:
+              command: ["dagster-daemon", "liveness-check"]
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 18
+          livenessProbe:
+            # A liveness check on the loop, not on the process: this asks the
+            # instance whether a heartbeat was written recently, so a daemon whose
+            # scheduler thread has wedged fails it while still having a live PID.
+            # There is no readiness probe because nothing routes traffic here.
+            exec:
+              command: ["dagster-daemon", "liveness-check"]
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: dagster-home
+              mountPath: /opt/dagster/home
+            - name: instance
+              mountPath: /opt/dagster/home/dagster.yaml
+              subPath: dagster.yaml
+              readOnly: true
+            - name: scratch
+              mountPath: /tmp
+      volumes:
+        - name: dagster-home
+          emptyDir: {}
+        - name: instance
+          configMap:
+            name: dagster-instance
+        - name: scratch
+          emptyDir: {}

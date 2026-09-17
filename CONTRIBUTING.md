@@ -49,11 +49,17 @@ Unit tests must stay offline and fast. If a test needs Kafka, MinIO or Spark, it
 is an integration test and belongs behind the `integration` marker so that
 someone without Docker running can still get a useful signal from `pytest`.
 
-Three targets talk to the public internet, and only these three: `make smoke-live`,
-which checks the source is reachable; `make test-e2e`, which feeds its scratch topic
-from the live stream; and `make query-duckdb`, whose first run downloads DuckDB's
-`httpfs` and `iceberg` extensions from extensions.duckdb.org and is offline after
-that. Everything else runs against captured fixtures and local containers.
+Five targets talk to the public internet, and only these five. Three of them touch
+the pipeline itself: `make smoke-live`, which checks the source is reachable;
+`make test-e2e`, which feeds its scratch topic from the live stream; and
+`make query-duckdb`, whose first run downloads DuckDB's `httpfs` and `iceberg`
+extensions from extensions.duckdb.org and is offline after that. The other two fetch
+tooling and then cache it: `make infra-validate` downloads the Terraform AWS
+provider into `infra/aws/.terraform`, and `make k8s-validate` downloads Kubernetes
+JSON schemas into `.cache/kubeconform`. Neither of those two reaches AWS or a
+cluster, which is the point of them — see `infra/aws/README.md`.
+
+Everything else runs against captured fixtures and local containers.
 
 ## Before you open a pull request
 

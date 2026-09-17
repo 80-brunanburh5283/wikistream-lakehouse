@@ -1,0 +1,48 @@
+# kind, or any single-node cluster on a laptop.
+#
+# Adds the two things the base leaves out — a Postgres to talk to and the addresses
+# of everything else — and takes the resource requests down far enough that both
+# pods schedule on one node that is already running Docker Desktop.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: wikistream
+
+resources:
+  - ../../base
+  - postgres.yaml
+
+configMapGenerator:
+  - name: wikistream-endpoints
+    literals:
+      # Cluster-local names, which is the whole difference between this overlay and
+      # a real one. The Kafka port is 9092 rather than the 29092 that
+      # docker-compose.yml uses: 29092 exists because Compose needs two listeners
+      # on one broker, one for the host and one for the network, and a cluster has
+      # no such split.
+      - WS_TRINO_HOST=trino
+      - WS_TRINO_PORT=8080
+      - WS_KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      # Everything about the database except the password, which is the only part
+      # of it that belongs in a Secret. `postgres` resolves to the headless Service
+      # in postgres.yaml.
+      - DAGSTER_PG_HOST=postgres
+      - DAGSTER_PG_DB=dagster
+      - DAGSTER_PG_USERNAME=dagster
+
+patches:
+  # One patch for both deployments, by kind rather than by name. 300m and 768Mi
+  # each is honest for what these processes do and it is 600m and 1.5Gi of
+  # reservation on a node that is also hosting the developer's Docker daemon, so
+  # the second pod sits Pending with "Insufficient memory" and the cluster looks
+  # broken. Requests only: the limits stay where the base put them, so a run that
+  # needs the memory can still have it.
+  - target:
+      kind: Deployment
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/cpu
+        value: 100m
+      - op: replace
+        path: /spec/template/spec/containers/0/resources/requests/memory
+        value: 512Mi

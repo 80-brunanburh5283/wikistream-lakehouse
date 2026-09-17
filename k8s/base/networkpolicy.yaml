@@ -1,0 +1,97 @@
+# The cluster half of the decision in infra/aws/modules/network/main.tf: no route
+# out that is not needed for something named.
+#
+# The interesting thing about applying that principle to Dagster here is how little
+# it turns out to need. This deployment holds no object-store credentials — every
+# table it reads and writes goes through Trino, and `make up` with an empty `.env`
+# proves that in the Compose version — so the orchestrator has no reason to reach
+# S3, or the internet, or anything outside its own namespace. Three policies
+# express that: deny everything, allow DNS, allow the namespace.
+#
+# These are enforced by the CNI, not by the API server. On a cluster running a CNI
+# without NetworkPolicy support they are accepted and ignored, silently, which is
+# the failure mode worth knowing about: `kubectl get networkpolicy` looks identical
+# either way. kind's default CNI is one of those, so k8s/README.md says to install
+# Calico before drawing any conclusion from a connectivity test.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  # An empty podSelector is every pod in the namespace, and naming both policy
+  # types with no rules underneath them is what makes this a default deny. Leave
+  # `egress` out of the list and egress stays unrestricted, which is the usual way
+  # this pattern is got wrong.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+spec:
+  # First thing to add back after a default deny, and the reason is that its
+  # absence does not look like a network problem. Every hostname in
+  # wikistream-endpoints stops resolving, so the logs fill with connection errors
+  # against `trino.wikistream.svc.cluster.local` and the obvious suspect is Trino.
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              # Set automatically on every namespace by the API server since 1.21,
+              # so this needs no cooperation from whoever created kube-system.
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-within-namespace
+spec:
+  # Postgres, Trino and the webserver's own port. Scoping to the namespace rather
+  # than writing a rule per service keeps this from needing to know which of them
+  # an overlay actually ships — overlays/local runs Postgres in here, a cluster
+  # with a Trino chart installed elsewhere would need one more rule, and both are
+  # correct without editing this file.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ui-from-ingress-controller
+spec:
+  # The one door in. Without this the Ingress in overlays/prod resolves to a
+  # Service whose endpoints the controller cannot reach, and the symptom is a 502
+  # from a component that has no idea a NetworkPolicy exists.
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: webserver
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 3000

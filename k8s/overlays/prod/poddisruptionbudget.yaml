@@ -1,0 +1,20 @@
+# One PDB, for the webserver, and none for the daemon.
+#
+# That asymmetry is the point of the file. `minAvailable: 1` against a
+# single-replica Deployment does not protect it — it blocks `kubectl drain` for
+# ever, because the only way to satisfy the budget is to never evict the only pod.
+# Node upgrades then stall on a component that would have been fine with thirty
+# seconds of downtime. The daemon is a singleton by design, so it gets no budget
+# and a drain moves it.
+#
+# The webserver has two replicas in this overlay, so a budget is meaningful: a
+# drain may take one, and must wait for its replacement before taking the other.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: dagster-webserver
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: webserver

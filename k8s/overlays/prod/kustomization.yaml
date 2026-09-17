@@ -1,0 +1,70 @@
+# A multi-node cluster with a managed database in front of it.
+#
+# This overlay has never been applied. Nothing in k8s/ has — see k8s/README.md. It
+# is here because the difference between it and overlays/local is the part of a
+# deployment worth arguing about, and a diff of two overlays is a clearer way to
+# say it than prose:
+#
+#   * no Postgres, because a managed one belongs here and a single-replica
+#     StatefulSet with no backups does not
+#   * two webservers and still exactly one daemon
+#   * an image from a registry at a tag, not a locally built one
+#   * an Ingress, a PodDisruptionBudget, and one more egress rule for a broker
+#     outside the cluster
+#
+# What it does not contain is the `wikistream-endpoints` ConfigMap. The local
+# overlay generates that, and this one cannot: the MSK bootstrap string is issued
+# by AWS and differs per account — it is literally an output of
+# `infra/aws/outputs.tf` — so it is a value that arrives from the environment
+# rather than from git. The Ingress hostname below is in git, because that is a
+# convention someone chose rather than an identifier something generated. That
+# line is where the boundary sits.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: wikistream
+
+resources:
+  - ../../base
+  - ingress.yaml
+  - poddisruptionbudget.yaml
+  - networkpolicy-msk.yaml
+
+images:
+  - name: wikistream/dagster-k8s
+    newName: ghcr.io/william-sarkar/wikistream-dagster
+    # A tag, not `latest`, and not a floating branch name. What updates it is CI on
+    # a tagged release, which is the commit that ArgoCD then syncs — the deployed
+    # version is a line in git rather than whatever the registry happens to serve.
+    # A digest would be stricter still and is what this should become; the reason it
+    # is a tag today is that no image has been published, so there is no digest to
+    # write and inventing one would be a lie a `kubectl apply` would catch.
+    newTag: 0.1.0
+
+replicas:
+  # Two, which Postgres storage makes possible and SQLite would not: either replica
+  # can serve any run's event log.
+  - name: dagster-webserver
+    count: 2
+  # The daemon is deliberately not in this list. It is a singleton — see the
+  # `strategy: Recreate` comment in base/deployment-daemon.yaml — and two of them
+  # evaluate the same schedules against the same tick table.
+
+patches:
+  # Spread the two webservers across nodes. Without this, both replicas can land on
+  # one node and the second replica buys nothing but memory: the failure it exists
+  # for is a node going away. `ScheduleAnyway` rather than `DoNotSchedule` because a
+  # single-node cluster, or a cluster mid-drain, should still run the UI.
+  - target:
+      kind: Deployment
+      name: dagster-webserver
+    patch: |
+      - op: add
+        path: /spec/template/spec/topologySpreadConstraints
+        value:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/component: webserver

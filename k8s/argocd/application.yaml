@@ -1,0 +1,74 @@
+# The GitOps half: one ArgoCD Application that owns the prod overlay.
+#
+# This is a bootstrap object and it is not itself owned by ArgoCD — someone applies
+# this file once, by hand, and after that every change to the deployment is a commit
+# to k8s/overlays/prod. The pattern that removes even this step is app-of-apps, where
+# one Application points at a directory of Applications; it is not here because this
+# repository has exactly one deployment and app-of-apps for one app is indirection
+# with nothing behind it.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: wikistream-dagster
+  namespace: argocd
+  finalizers:
+    # Without this, deleting the Application leaves every object it created running
+    # and untracked, which is the state that produces "why is this pod still here
+    # and what manages it" six months later.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  # `default`, which permits any source and any destination. A real cluster narrows
+  # that with an AppProject restricting this Application to this repository and this
+  # namespace, and that object belongs to whoever runs ArgoCD rather than to this
+  # repository — an AppProject here would be this repository granting itself
+  # permissions on someone else's cluster.
+  project: default
+
+  source:
+    repoURL: https://github.com/william-sarkar/wikistream-lakehouse.git
+    path: k8s/overlays/prod
+    # A branch, not a tag, and this is a trade-off rather than a default. Tracking
+    # `main` means a merge deploys, which is what makes the pipeline continuous;
+    # it also means the deployed version is whatever `main` points at now rather
+    # than something anyone chose. A cluster that needs a change window pins a tag
+    # here and moves it deliberately. The image tag in the overlay is pinned either
+    # way, so what floats is the manifests, not the code.
+    targetRevision: main
+
+  destination:
+    # `in-cluster` is the name ArgoCD gives the cluster it runs in. A remote cluster
+    # would be a server URL and a registered credential.
+    name: in-cluster
+    namespace: wikistream
+
+  syncPolicy:
+    automated:
+      # Delete objects that have been removed from git. Off by default in ArgoCD,
+      # and off is the wrong default for a deployment that is meant to be a mirror
+      # of a directory: without prune, deleting a manifest leaves the object running
+      # and the Application reports Synced, so git stops describing the cluster.
+      prune: true
+      # Revert manual changes. The point is not to stop people editing the cluster —
+      # it is to make an edit that was meant to be permanent fail loudly within
+      # three minutes, so it goes into git instead of into someone's memory.
+      selfHeal: true
+    syncOptions:
+      # False on purpose. base/namespace.yaml creates the namespace, because it
+      # carries the Pod Security Standards labels that reject an unhardened pod.
+      # A namespace ArgoCD creates has no labels, so letting it do that here would
+      # silently drop an enforcement boundary.
+      - CreateNamespace=false
+      # Server-side apply, so field ownership is tracked by the API server. It is
+      # what makes a resource that a mutating webhook or an autoscaler also writes
+      # to stop flapping between Synced and OutOfSync.
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 15s
+        factor: 2
+        maxDuration: 5m
+
+  # Ten, rather than the default ten thousand-ish: this is the history ArgoCD keeps
+  # for rollback, and git has the real one.
+  revisionHistoryLimit: 10

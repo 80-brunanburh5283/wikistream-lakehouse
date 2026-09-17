@@ -1,0 +1,22 @@
+# ClusterIP, and only for the webserver. The daemon has no Service because nothing
+# connects to it — it talks to Postgres and to the tables, and is talked to by
+# nobody. A Service in front of it would be an invitation to think otherwise.
+#
+# There is no Ingress in the base either. Exposing the Dagster UI is an
+# environment's decision, not the application's: overlays/local reaches it with
+# `kubectl port-forward` and overlays/prod adds an Ingress with TLS. A base that
+# shipped an Ingress would mean the local overlay had to delete one.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dagster-webserver
+  labels:
+    app.kubernetes.io/component: webserver
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/component: webserver
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http

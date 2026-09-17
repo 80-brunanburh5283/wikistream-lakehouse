@@ -1,0 +1,135 @@
+# Postgres for the Dagster instance, in the local overlay only.
+#
+# It is here and not in the base because a cluster that has a managed database
+# should use it: overlays/prod points DAGSTER_PG_HOST at RDS and ships none of
+# this. Running your own single-replica Postgres with no backups is right for a
+# throwaway kind cluster and wrong everywhere else, and the way to say that in
+# kustomize is to put it in one overlay.
+#
+# A StatefulSet rather than a Deployment, for the volume rather than for the
+# ordinal: a Deployment with a PVC will happily start a second pod attached to the
+# same ReadWriteOnce volume during a rolling update, and two postmasters on one
+# data directory is how a database gets corrupted. StatefulSets stop the old pod
+# before starting the new one.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/component: postgres
+spec:
+  # Headless. Nothing load-balances a single database, and a StatefulSet needs a
+  # governing Service to give its pod a stable DNS name.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/component: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/component: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/component: postgres
+    spec:
+      # No token here either, for the same reason as the Dagster pods.
+      automountServiceAccountToken: false
+      securityContext:
+        # uid 70 is `postgres` in the alpine image. fsGroup is what makes the
+        # freshly provisioned PVC writable by it — without it the first start
+        # fails with "could not create directory: Permission denied", which reads
+        # like a broken image rather than a missing four lines.
+        runAsUser: 70
+        runAsGroup: 70
+        runAsNonRoot: true
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:18.6-alpine
+          env:
+            - name: POSTGRES_DB
+              value: dagster
+            - name: POSTGRES_USER
+              value: dagster
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                # The same Secret and the same key the Dagster pods read, so there
+                # is exactly one place the password exists and it is not in this
+                # repository. Two literals would be two things to keep equal, and
+                # the failure when they diverge is an authentication error against
+                # a database that was created seconds earlier.
+                secretKeyRef:
+                  name: dagster-postgres
+                  key: DAGSTER_PG_PASSWORD
+            - name: PGDATA
+              # Explicit, and this is the one line in this file that would silently
+              # lose data if it were wrong. Postgres 18's official image moved
+              # PGDATA from /var/lib/postgresql/data to /var/lib/postgresql/18/docker
+              # and moved its VOLUME up to /var/lib/postgresql. Mount a PVC at the
+              # old path on an 18 image and the database initialises somewhere
+              # else — on the container filesystem — so it works, passes its probe,
+              # and is empty after the first restart.
+              value: /var/lib/postgresql/18/docker
+          ports:
+            - name: postgres
+              containerPort: 5432
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            # Not readOnlyRootFilesystem: the entrypoint writes a socket into
+            # /var/run/postgresql and config into PGDATA. Both could be given
+            # emptyDirs, and on a local throwaway database that is more moving
+            # parts than the control is worth.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            exec:
+              # `pg_isready` against the unix socket, not against localhost:5432.
+              # The TCP listener accepts connections during recovery, so a TCP
+              # probe reports a database ready that answers every query with "the
+              # database system is starting up".
+              command: ["pg_isready", "-U", "dagster", "-d", "dagster", "-h", "/var/run/postgresql"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "dagster", "-d", "dagster", "-h", "/var/run/postgresql"]
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            # Run history and event logs for three jobs on a laptop cluster. The
+            # retention settings in dagster.yaml are what keep this from being the
+            # wrong number in six months.
+            storage: 2Gi

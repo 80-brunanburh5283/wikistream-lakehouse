@@ -1,0 +1,36 @@
+# The Dagster control plane, and deliberately nothing else.
+#
+# Kafka, Spark, MinIO and Trino are not here. Those run in Compose, which is what
+# this repository's `make up` brings up and what its README documents; running them
+# on Kubernetes as well would be a second data plane to keep honest, and the first
+# thing a reader would find is that it had drifted. What is here is the one
+# component whose deployment story genuinely changes on a cluster — see
+# k8s/README.md — plus the addresses it needs to find the rest.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: wikistream
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - service-webserver.yaml
+  - deployment-webserver.yaml
+  - deployment-daemon.yaml
+  - networkpolicy.yaml
+
+configMapGenerator:
+  # Generated rather than written out as a ConfigMap manifest so that the name gets
+  # a content hash: editing dagster.yaml then changes the name the deployments
+  # reference, and both pods roll. The alternative — a static ConfigMap — leaves
+  # the old configuration running in pods that were never restarted, and
+  # `kubectl get configmap` shows the new one, which is a confusing half hour.
+  - name: dagster-instance
+    files:
+      - dagster.yaml
+
+labels:
+  - includeSelectors: true
+    pairs:
+      app.kubernetes.io/name: dagster
+      app.kubernetes.io/part-of: wikistream-lakehouse
