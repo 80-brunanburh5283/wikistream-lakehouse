@@ -5,10 +5,14 @@
 #                  always enabled, so `docker compose up` starts exactly them,
 #                  and a profile that can never be turned off is a longer way of
 #                  writing no profile at all. `make up-core` is this tier.
-#    full          adds Trino, dbt and Dagster. `make up`.
+#    full          adds Trino and Dagster — the long-running query and control
+#                  planes. `make up`.
 #    producer      the ingester. Kept out of the always-on tier so that a bounded
 #                  test run and a long-lived ingest are never both writing to the
 #                  topic without someone having asked for that. `make ingest`.
+#    dbt           a one-shot run through `docker compose run`, not something `up`
+#                  should start. Its own profile so that `up --wait` never waits
+#                  for a container whose whole job is to exit.
 #
 #  Three conventions worth knowing before reading further:
 #
@@ -261,6 +265,101 @@ services:
       retries: 3
       start_period: 5s
     stop_grace_period: 30s
+
+  # ------------------------------------------------------------------- trino
+  #
+  # The query engine, and the reason this project can claim a lakehouse rather
+  # than "Spark with extra steps": Trino is given no information about how the
+  # tables were produced. It reads the same REST catalog Spark commits to and the
+  # same Parquet out of the same bucket. `make query` prints the proof.
+  #
+  # One container, coordinator and worker in the same JVM
+  # (`node-scheduler.include-coordinator=true`, which is the image's own default
+  # single-node config). Splitting them would demonstrate a distribution this
+  # data volume does not need, at the cost of a second 1.6 GB heap.
+  trino:
+    image: trinodb/trino:483
+    container_name: wikistream-trino
+    profiles: ["full"]
+    logging: *logging
+    depends_on:
+      iceberg-rest:
+        condition: service_healthy
+    ports:
+      - "${WS_TRINO_PORT:-8080}:8080"
+    environment:
+      # Read by ${ENV:...} in docker/trino/catalog/lakehouse.properties, so the
+      # credential is never written into a file in this repository.
+      AWS_ACCESS_KEY_ID: ${WS_S3_ACCESS_KEY:-minioadmin}
+      AWS_SECRET_ACCESS_KEY: ${WS_S3_SECRET_KEY:-minioadmin}
+    volumes:
+      # The whole catalog directory, not one file into it: a bind mount of a
+      # single file would leave the image's tpch, tpcds, jmx and memory catalogs
+      # in place, and `SHOW CATALOGS` listing five things when the project has one
+      # is the kind of small dishonesty that makes a reviewer check everything
+      # else twice. Everything outside this directory stays as the image ships it.
+      - ./docker/trino/catalog:/etc/trino/catalog:ro
+    # The image's jvm.config asks for 80% of available memory as the *initial*
+    # heap, so this limit is also the allocation: 2 GB here means ~1.6 GB
+    # committed at start-up. Stated as a limit so an under-provisioned machine
+    # gets an OOM kill with a clear cause rather than a stack that swaps.
+    mem_limit: 2g
+    healthcheck:
+      # /v1/info reports `"starting":true` for the first several seconds after the
+      # HTTP server binds, and a query submitted in that window fails with
+      # SERVER_STARTING_UP. Waiting for `false` is the difference between
+      # `depends_on: service_healthy` meaning something and meaning nothing.
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://localhost:8080/v1/info | grep -q '\"starting\":false'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 15s
+
+  # --------------------------------------------------------------------- dbt
+  #
+  # A one-shot, not a service: `docker compose run --rm dbt <args>`, which is what
+  # the `make dbt-*` targets do. `docker compose run` enables the target service's
+  # profile implicitly, so this stays out of `make up` — a container whose job is
+  # to exit is not something `up --wait` should be waiting on.
+  #
+  # It exists at all so that the transform layer can be run by someone who has
+  # Docker and nothing else. `uv run dbt` against the same project works too and
+  # is what CI does.
+  dbt:
+    build:
+      context: .
+      dockerfile: docker/dbt.Dockerfile
+    image: wikistream/dbt:local
+    container_name: wikistream-dbt
+    profiles: ["dbt"]
+    logging: *logging
+    depends_on:
+      trino:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      WS_TRINO_HOST: trino
+      WS_TRINO_PORT: 8080
+    # Whoever owns ./dbt on the host, so target/ and logs/ do not come back
+    # root-owned. The Makefile passes `id -u`:`id -g`; the fallback is the first
+    # uid a Linux desktop hands out, which is right often enough to be a useful
+    # default and wrong loudly rather than silently when it is not.
+    user: "${WS_DOCKER_USER:-1000:1000}"
+    volumes:
+      # Read-write, unlike the Spark mounts: dbt writes target/ and logs/ next to
+      # the project, and having them land in the working tree (both gitignored)
+      # means `dbt docs` and a failed-test artefact are readable from the host
+      # rather than trapped in a container that `--rm` just deleted.
+      - ./dbt:/opt/dbt
+    working_dir: /opt/dbt
+    entrypoint: ["dbt"]
+    command: ["--version"]
 
   # ----------------------------------------------------------------- ingest
   producer:
