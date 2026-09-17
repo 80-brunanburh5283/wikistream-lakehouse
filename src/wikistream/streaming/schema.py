@@ -34,8 +34,10 @@ promised could not exist. Worse, a non-nullable declaration is a licence for the
 optimiser to fold away the null check that would have caught it.
 
 Required-ness is therefore enforced where it can be — as an explicit predicate
-over the parsed row, routing failures to `silver.quarantine`. `REQUIRED_FIELDS`
-is that predicate's input, and it is the only place "required" means anything.
+over the parsed row, routing failures to `silver.quarantine`.
+`wikistream.events.REQUIRED_FIELDS` is that predicate's input, and it is the only
+place "required" means anything. It lives there rather than here so that the
+producer, which has no Spark in its image, can read the same contract.
 """
 
 from __future__ import annotations
@@ -153,24 +155,6 @@ RECENTCHANGE_SCHEMA = StructType(
         StructField("log_action_comment", StringType(), nullable=True),
     ]
 )
-
-#: Fields without which a row cannot be processed at all, checked explicitly
-#: because `from_json` will not check it. `meta.id` is the dedup key, `meta.dt`
-#: is the event time the watermark reads, and `meta.domain` is the Kafka
-#: partition key; a row missing any of them cannot be placed, ordered or
-#: deduplicated, so it goes to `silver.quarantine` instead of silently poisoning
-#: the merge. All three were present in 100% of the sample — the check exists
-#: for the day that stops being true.
-REQUIRED_FIELDS: tuple[str, ...] = (
-    "meta.id",
-    "meta.dt",
-    "meta.domain",
-)
-
-#: The dedup key, as it is named once it reaches bronze and silver. `meta.id` is
-#: renamed on the way in so that no downstream SQL has to quote a nested path,
-#: and so the Iceberg tables read as tables rather than as a JSON dump.
-EVENT_ID_COLUMN = "event_id"
 
 #: Every top-level key the schema declares. Used by the drift test.
 TOP_LEVEL_FIELDS: frozenset[str] = frozenset(field.name for field in RECENTCHANGE_SCHEMA.fields)

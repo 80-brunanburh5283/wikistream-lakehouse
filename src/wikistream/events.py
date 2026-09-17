@@ -12,6 +12,13 @@ worse — a Python UDF in the streaming path would serialise every row out of th
 JVM and back, and pushing these rules into SQL only would leave them untestable
 without a five-second Spark session per assertion. The mitigation is that the
 rules are small, total, and pinned by the adversarial fixture.
+
+**This module must not import pyspark, directly or transitively.** The producer
+image contains no Spark — that is the point of it being a 250 MB image rather than
+a 700 MB one — and the producer imports `partition_key` from here. An import of
+`wikistream.streaming.schema` for the sake of one tuple of strings is what broke
+that once already, which is why the field contract below lives here, in the
+Spark-free module, and the Spark schema is the thing that reads across.
 """
 
 from __future__ import annotations
@@ -21,7 +28,23 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
-from wikistream.streaming.schema import REQUIRED_FIELDS
+#: Fields without which a row cannot be processed at all, checked explicitly
+#: because `from_json` will not check it. `meta.id` is the dedup key, `meta.dt`
+#: is the event time the watermark reads, and `meta.domain` is the Kafka
+#: partition key; a row missing any of them cannot be placed, ordered or
+#: deduplicated, so it goes to `silver.quarantine` instead of silently poisoning
+#: the merge. All three were present in 100% of the sample — the check exists
+#: for the day that stops being true.
+REQUIRED_FIELDS: tuple[str, ...] = (
+    "meta.id",
+    "meta.dt",
+    "meta.domain",
+)
+
+#: The dedup key, as it is named once it reaches bronze and silver. `meta.id` is
+#: renamed on the way in so that no downstream SQL has to quote a nested path,
+#: and so the Iceberg tables read as tables rather than as a JSON dump.
+EVENT_ID_COLUMN = "event_id"
 
 #: MediaWiki temporary accounts, introduced for unregistered editors. The name
 #: looks like `~2026-12345` and is not an IP, but it is not a registered account

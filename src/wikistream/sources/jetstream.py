@@ -36,7 +36,7 @@ from websockets.sync.client import connect
 from wikistream.config import USER_AGENT, Settings
 from wikistream.logging import get_logger
 from wikistream.sources.backoff import ExponentialBackoff
-from wikistream.sources.base import SourceStats
+from wikistream.sources.base import SourceEvent, SourceStats
 
 log = get_logger(__name__)
 
@@ -95,7 +95,13 @@ class JetstreamSource:
         return urlunparse(parts._replace(query=urlencode(params)))
 
     def iter_events(self) -> Iterator[dict[str, Any]]:
-        """Yield decoded events until `stop` is called, absorbing transient faults."""
+        """Yield decoded events until `stop` is called, skipping unreadable messages."""
+        for item in self.iter_raw():
+            if item.payload is not None:
+                yield item.payload
+
+    def iter_raw(self) -> Iterator[SourceEvent]:
+        """Yield every message until `stop` is called, absorbing transient faults."""
         while not self._stop_event.is_set():
             try:
                 yield from self._stream_once()
@@ -105,8 +111,8 @@ class JetstreamSource:
                 if not self._stop_event.is_set():
                     self._sleep_before_retry("stream closed by server")
 
-    def _stream_once(self) -> Iterator[dict[str, Any]]:
-        """Hold one WebSocket open, yielding events until it closes."""
+    def _stream_once(self) -> Iterator[SourceEvent]:
+        """Hold one WebSocket open, yielding messages until it closes."""
         url = self._resume_url()
         log.info(
             "connecting to jetstream",
@@ -128,29 +134,35 @@ class JetstreamSource:
             for message in socket:
                 if self._stop_event.is_set():
                     return
-                payload = message.decode() if isinstance(message, bytes) else message
-                self._stats.bytes_received += len(payload)
-
-                try:
-                    event: dict[str, Any] = json.loads(payload)
-                except json.JSONDecodeError:
-                    self._stats.malformed += 1
-                    log.warning(
-                        "discarding malformed message",
-                        extra={"malformed_total": self._stats.malformed},
-                    )
-                    continue
-
-                time_us = event.get("time_us")
-                if isinstance(time_us, int):
-                    self._cursor = str(time_us)
-                    self._stats.last_cursor = self._cursor
+                raw = message.decode() if isinstance(message, bytes) else message
+                self._stats.bytes_received += len(raw)
 
                 if first_event:
                     self._backoff.reset()
                     first_event = False
-                self._stats.events += 1
-                yield event
+
+                event: dict[str, Any] | None
+                try:
+                    decoded = json.loads(raw)
+                except json.JSONDecodeError:
+                    event = None
+                    self._stats.malformed += 1
+                    log.warning(
+                        "message did not decode, forwarding raw",
+                        extra={"malformed_total": self._stats.malformed},
+                    )
+                else:
+                    event = decoded if isinstance(decoded, dict) else None
+                    if event is None:
+                        self._stats.malformed += 1
+                    else:
+                        self._stats.events += 1
+                        time_us = event.get("time_us")
+                        if isinstance(time_us, int):
+                            self._cursor = str(time_us)
+                            self._stats.last_cursor = self._cursor
+
+                yield SourceEvent(raw=raw, payload=event, cursor=self._cursor)
 
     def _sleep_before_retry(self, reason: str) -> None:
         """Log the fault and wait, waking early if shutdown is requested."""

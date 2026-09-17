@@ -19,12 +19,8 @@ from pyspark.sql.types import (
     StructType,
 )
 
-from wikistream.streaming.schema import (
-    EVENT_ID_COLUMN,
-    RECENTCHANGE_SCHEMA,
-    REQUIRED_FIELDS,
-    TOP_LEVEL_FIELDS,
-)
+from wikistream.events import EVENT_ID_COLUMN, REQUIRED_FIELDS
+from wikistream.streaming.schema import RECENTCHANGE_SCHEMA, TOP_LEVEL_FIELDS
 
 pytestmark = pytest.mark.unit
 

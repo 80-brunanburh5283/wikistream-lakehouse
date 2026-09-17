@@ -73,6 +73,23 @@ class Settings(BaseSettings):
     kafka_linger_ms: int = Field(default=100, ge=0)
     kafka_batch_size_bytes: int = Field(default=65_536, ge=1)
     kafka_stats_interval_seconds: float = Field(default=10.0, gt=0)
+    #: `recentchange` payloads are verbose JSON with a small vocabulary of keys, so
+    #: they compress hard: 4.2x to 4.3x measured, against 3.2x for lz4 and snappy.
+    #: gzip measured marginally *better* than zstd, by less than the run-to-run
+    #: variance, so the default is not a ratio win — see docs/throughput.md for the
+    #: numbers and for why zstd is still the one chosen.
+    kafka_compression_type: str = Field(default="zstd")
+    #: Bounded producer buffer. librdkafka's default is 1 GB, which on a laptop
+    #: means a broker outage is absorbed silently until the process is OOM-killed.
+    #: 64 MB fails fast instead — `send` blocks, the log says why.
+    kafka_buffer_max_kbytes: int = Field(default=65_536, ge=1_024)
+    #: Heartbeat file the producer touches once per stats interval. The container
+    #: healthcheck reads its age; nothing else does.
+    producer_heartbeat_path: str = Field(default="/tmp/wikistream-producer.heartbeat")
+    #: Must exceed the longest legitimate quiet period, which is a full backoff
+    #: delay (60s) plus a stats interval. 180s leaves headroom without letting a
+    #: genuinely wedged process look healthy for minutes.
+    producer_heartbeat_timeout_seconds: float = Field(default=180.0, gt=0)
 
     # ------------------------------------------------------------ object store
     s3_endpoint: str = Field(default="http://localhost:9000")

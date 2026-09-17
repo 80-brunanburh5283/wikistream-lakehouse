@@ -24,7 +24,7 @@ import httpx
 from wikistream.config import USER_AGENT, Settings
 from wikistream.logging import get_logger
 from wikistream.sources.backoff import ExponentialBackoff
-from wikistream.sources.base import SourceStats
+from wikistream.sources.base import SourceEvent, SourceStats
 from wikistream.sources.sse import parse_sse_lines
 
 log = get_logger(__name__)
@@ -82,7 +82,13 @@ class WikimediaSource:
         self._stop_event.set()
 
     def iter_events(self) -> Iterator[dict[str, Any]]:
-        """Yield decoded events until `stop` is called.
+        """Yield decoded events until `stop` is called, skipping unreadable frames."""
+        for item in self.iter_raw():
+            if item.payload is not None:
+                yield item.payload
+
+    def iter_raw(self) -> Iterator[SourceEvent]:
+        """Yield every frame until `stop` is called, decoded where possible.
 
         Transient faults are absorbed: a dropped connection, a read timeout or a
         5xx becomes a logged reconnect with a backoff delay. Only a status in
@@ -116,8 +122,8 @@ class WikimediaSource:
                     if not self._stop_event.is_set():
                         self._sleep_before_retry("stream closed by server")
 
-    def _stream_once(self, client: httpx.Client) -> Iterator[dict[str, Any]]:
-        """Hold one connection open, yielding events until it ends."""
+    def _stream_once(self, client: httpx.Client) -> Iterator[SourceEvent]:
+        """Hold one connection open, yielding frames until it ends."""
         headers = {
             "User-Agent": USER_AGENT,
             "Accept": "text/event-stream",
@@ -142,25 +148,39 @@ class WikimediaSource:
                     self._stats.last_cursor = frame.last_event_id
                 self._stats.bytes_received += len(frame.data)
 
-                try:
-                    event: dict[str, Any] = json.loads(frame.data)
-                except json.JSONDecodeError:
-                    # One unparseable frame in a firehose must not stop the
-                    # process. Count it so a schema change shows up as a number.
-                    self._stats.malformed += 1
-                    log.warning(
-                        "discarding malformed frame",
-                        extra={"malformed_total": self._stats.malformed},
-                    )
-                    continue
-
                 if first_event:
-                    # Reset only now: a connection that is accepted and closed
-                    # without delivering anything must not clear the backoff.
+                    # Reset on the first frame of any kind: a connection that is
+                    # accepted and closed without delivering anything must not
+                    # clear the backoff, but one delivering even a bad frame is
+                    # demonstrably alive.
                     self._backoff.reset()
                     first_event = False
-                self._stats.events += 1
-                yield event
+
+                payload: dict[str, Any] | None
+                try:
+                    payload = json.loads(frame.data)
+                except json.JSONDecodeError:
+                    # Counted and forwarded, not dropped. One unparseable frame
+                    # in a firehose must not stop the process, and it must not
+                    # vanish either: the quarantine table exists to hold exactly
+                    # this, and a frame discarded here would never reach it.
+                    payload = None
+                    self._stats.malformed += 1
+                    log.warning(
+                        "frame did not decode, forwarding raw",
+                        extra={"malformed_total": self._stats.malformed},
+                    )
+                else:
+                    if not isinstance(payload, dict):
+                        # Valid JSON that is not an object — a bare number or an
+                        # array. Nothing downstream can key it, so it travels the
+                        # same path as undecodable input.
+                        payload = None
+                        self._stats.malformed += 1
+                    else:
+                        self._stats.events += 1
+
+                yield SourceEvent(raw=frame.data, payload=payload, cursor=self._cursor)
 
     def _sleep_before_retry(self, reason: str) -> None:
         """Log the fault and wait, waking early if shutdown is requested."""

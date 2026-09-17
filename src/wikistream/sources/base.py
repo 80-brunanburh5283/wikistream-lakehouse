@@ -5,10 +5,16 @@ Bluesky's Jetstream WebSocket firehose (fallback, if Wikimedia becomes
 unreachable or changes shape). Putting them behind one protocol means switching
 is a config change rather than a rewrite of the producer.
 
-The protocol is deliberately narrow. A source yields decoded JSON objects and
-tracks a resumption cursor; everything else — keying, batching, delivery
-guarantees — belongs to the sink, which is the only component that knows what
-Kafka wants.
+The protocol is deliberately narrow. A source yields frames and tracks a
+resumption cursor; everything else — keying, batching, delivery guarantees —
+belongs to the sink, which is the only component that knows what Kafka wants.
+
+There are two ways to read a source and the difference matters. `iter_raw` gives
+every frame that arrived, verbatim, including ones that are not valid JSON.
+`iter_events` gives only the frames that decoded, as dicts. The producer uses the
+first, because ingest must not silently discard what it cannot understand; the
+capture and measurement scripts use the second, because they are doing analysis
+and a frame they cannot read is of no use to them.
 """
 
 from __future__ import annotations
@@ -16,6 +22,25 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
+
+
+@dataclass(frozen=True, slots=True)
+class SourceEvent:
+    """One frame as it arrived, with the decode attempt attached."""
+
+    #: The frame body verbatim, *not* re-serialised from `payload`. The producer
+    #: forwards these bytes to Kafka unchanged and bronze keeps them as the audit
+    #: record, so a round trip through a dict — which would rewrite key order and
+    #: number formatting — would mean bronze no longer holds what the wire held.
+    raw: str
+    #: None when the frame would not decode. Such frames are still yielded here.
+    #: Dropping them would make ingest a validation gate wearing an audit trail's
+    #: clothes, and would make the quarantine path downstream unreachable in
+    #: production — a correctness feature that can never fire is not one.
+    payload: dict[str, Any] | None
+    #: The source's resumption position *as of this frame*, so a consumer can
+    #: record how far it has durably got without reaching back into the source.
+    cursor: str | None = None
 
 
 @dataclass
@@ -63,12 +88,20 @@ class EventSource(Protocol):
         """Live counters. Read by the producer for its throughput log."""
         ...
 
-    def iter_events(self) -> Iterator[dict[str, Any]]:
-        """Yield decoded events forever, reconnecting as needed.
+    def iter_raw(self) -> Iterator[SourceEvent]:
+        """Yield every frame forever, reconnecting as needed.
 
         Implementations must not raise on a transient network fault or a single
         malformed frame — they reconnect with backoff and count the failure. The
         iterator ends only on a shutdown request.
+        """
+        ...
+
+    def iter_events(self) -> Iterator[dict[str, Any]]:
+        """Yield only the frames that decoded, as dicts.
+
+        A convenience view over `iter_raw` for callers doing analysis in Python.
+        Not what the producer uses; see this module's docstring.
         """
         ...
 
