@@ -63,9 +63,12 @@ from pyspark.sql.types import (
 #   revision.new             2,546,877,183  2,147,483,647
 #   meta.offset              6,524,211,441  2,147,483,647
 #
-# On overflow Spark's JSON parser yields null, not an error, so an IntegerType
-# here would quietly delete the revision ids of the largest wikis while every
-# count and every health check stayed green. `timestamp` fits int32 today and is
+# An IntegerType here would not merely truncate those. Measured under
+# PERMISSIVE mode on Spark 4.0.4: a value too wide for the declared type sets
+# `_corrupt_record`, which this pipeline treats as unreadable — so the whole
+# event is quarantined, not just the offending column. Loud rather than quiet,
+# but the loss is larger: every edit on the biggest wikis would land in
+# `silver.quarantine` and nowhere else. `timestamp` fits int32 today and is
 # LongType anyway, because epoch seconds stop fitting in January 2038.
 #
 # `namespace` is IntegerType on purpose: MediaWiki namespace ids are a small

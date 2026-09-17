@@ -86,6 +86,19 @@ def partition_key(event: dict[str, Any]) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def raw_event_time(event: dict[str, Any]) -> str | None:
+    """`meta.dt` exactly as it arrived, unparsed.
+
+    Kept separate from `event_time` so that "the field was not sent" and "the field
+    was sent and was unreadable" stay distinguishable. They are different upstream
+    faults — a dropped field is a contract change, a bad value is usually one wiki
+    misbehaving — and a dead-letter table that conflates them costs whoever reads it
+    the first hour of the investigation.
+    """
+    value = _dig(event, "meta.dt")
+    return value if isinstance(value, str) else None
+
+
 def event_time(event: dict[str, Any]) -> datetime | None:
     """Parse `meta.dt` into an aware UTC datetime, or None if unusable.
 
