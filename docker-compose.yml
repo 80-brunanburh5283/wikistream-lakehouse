@@ -179,7 +179,27 @@ services:
       # The fixture defaults to an in-memory SQLite catalog, which silently
       # forgets every table on restart — and restart survival is the property
       # this project exists to demonstrate. A file on a volume instead.
-      CATALOG_URI: jdbc:sqlite:file:/home/iceberg/catalog.db
+      #
+      # WAL because a file written to continuously should not have its readers
+      # blocking its writer, and a busy timeout because the default is to wait three
+      # seconds. Neither is sufficient on its own — see CATALOG_CLIENTS below and
+      # DECISIONS.md ADR-0039, which has the measured sequence. WAL needs shared
+      # memory, which is one more reason this database lives on a Docker volume
+      # rather than a bind mount from a Windows drive.
+      CATALOG_URI: jdbc:sqlite:file:/home/iceberg/catalog.db?journal_mode=WAL&busy_timeout=30000
+      # One JDBC connection, not Iceberg's default two, and this is the setting that
+      # makes concurrent commits work. Every writer in the deployment — both Spark
+      # streams, Trino, dbt, DuckDB — reaches the catalog through this one process,
+      # so its connection pool is the only place their commits can be ordered.
+      # SQLite permits one writer, and when a connection tries to promote a read to
+      # a write it returns SQLITE_BUSY *immediately* rather than waiting, because
+      # waiting there could deadlock — so the busy timeout above does not help on
+      # that path. A pool of one moves the contention to a Java monitor, which has
+      # a queue. Without it, `make dbt-run` fails on whichever model loses the race.
+      CATALOG_CLIENTS: "1"
+      # Views live in the iceberg_tables table, keyed by an iceberg_type column,
+      # and that column only exists under schema version V1. Without this the
+      # catalog starts fine and fails the first CREATE VIEW.
       CATALOG_JDBC_SCHEMA__VERSION: V1
       AWS_ACCESS_KEY_ID: ${WS_S3_ACCESS_KEY:-minioadmin}
       AWS_SECRET_ACCESS_KEY: ${WS_S3_SECRET_KEY:-minioadmin}

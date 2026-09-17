@@ -1934,3 +1934,85 @@ its volume one level up at `/var/lib/postgresql`. Postgres 18's official image m
 both, and a manifest that mounts a PVC at the old `/var/lib/postgresql/data`
 initialises the database onto the container filesystem instead: it starts, it passes
 its readiness probe, and it is empty after the first restart.
+
+## ADR-0039 — Give the SQLite catalog one JDBC connection instead of two
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+The Iceberg REST catalog keeps its table pointers in SQLite — a file on a volume
+rather than the fixture image's in-memory default, so that tables survive a restart,
+which is the property this project exists to demonstrate. The first time
+`make dbt-run` ran against a stack with data in it, dbt failed:
+
+```
+Database Error in model stg_edits
+  TrinoExternalError(name=ICEBERG_CATALOG_ERROR, message="Failed to create view 'stg_edits'")
+```
+
+Trino reports a 500 from the catalog and nothing else, so the cause is only visible in
+the catalog's own log:
+
+```
+org.apache.iceberg.jdbc.UncheckedSQLException: Unknown failure
+  at org.apache.iceberg.jdbc.JdbcViewOperations.doCommit(JdbcViewOperations.java:136)
+Caused by: org.sqlite.SQLiteException: [SQLITE_BUSY] The database file is locked
+```
+
+`dbt/profiles.yml` sets `threads: 4`, so two models commit at the same time. SQLite
+allows one writer, which is not by itself the problem — the problem is that it does
+not always *queue* the second one. When a connection has already read inside its
+transaction and then tries to write, SQLite returns `SQLITE_BUSY` immediately without
+consulting the busy handler, because blocking there could deadlock with the
+connection it is waiting for. A busy timeout has no effect on that path. Iceberg's
+`JdbcClientPool` opens two connections by default, both writing the same file, which
+is exactly that path.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| `dbt/profiles.yml threads: 1` | It narrows the race without closing it. dbt is not the only writer: both Spark streams commit every micro-batch and would still collide with dbt, so the same error would come back as an occasional failed mart rather than a reproducible one. Intermittent is worse. |
+| Postgres as the catalog backend | The real answer for a real deployment, and what ADR-0038 does for Dagster on Kubernetes. Here it buys a container and about 200 MB of resident set on a 12 GB laptop to serialise a few writes a second, and the thing it would fix is fixed for nothing below. |
+| `transaction_mode=IMMEDIATE` on the JDBC URL | Tried, measured, did not work. It makes the driver open transactions with `BEGIN IMMEDIATE`, which would take the write lock up front and turn the upgrade into a wait — but the Iceberg calls that fail run in autocommit, so there is no `BEGIN` for the setting to apply to. The error changed from `SQLITE_BUSY` to `SQLITE_BUSY_SNAPSHOT` and the models kept failing. Removed again. |
+| `clients: 1` on the catalog, plus WAL and a busy timeout | Chosen. |
+
+### Decision
+
+Three settings on the `iceberg-rest` service in `docker-compose.yml`:
+
+- `CATALOG_CLIENTS: "1"` — one JDBC connection for the whole catalog. This is the one
+  that fixed it. Every writer in the deployment reaches the catalog through this one
+  process, so its connection pool is the only place their commits can be ordered, and
+  a pool of one orders them: the second caller waits on a Java monitor, which has a
+  queue, instead of on a file lock, which returns an error.
+- `journal_mode=WAL` and `busy_timeout=30000` in the JDBC URL. WAL alone was enough to
+  get the two views created and not enough for the five marts, which is how the
+  sequence above was measured. They stay because they are the right settings for a
+  file written to continuously — readers no longer block the writer, and the timeout
+  applies on the paths where the busy handler *is* consulted.
+
+`CATALOG_JDBC_SCHEMA__VERSION: V1` was already set and is unrelated, but it is the
+other thing that has to be right for views to work at all: under V1 a view is a row
+in `iceberg_tables` with `iceberg_type = 'VIEW'`, and without the setting that column
+does not exist and the first `CREATE VIEW` fails.
+
+### Consequence
+
+Verified after the change: `make dbt-run` green on six consecutive runs, two of them
+with the bronze and silver streams both committing throughout, and zero `SQLITE_BUSY`
+lines in the catalog log across all six. `make dbt-test` passes 61 tests.
+
+Every catalog operation in the stack now serialises through one connection. At this
+scale that is invisible — a commit is a single-row insert and Trino's metadata reads
+are sub-millisecond — but it is a real ceiling, and the shape of it is worth being
+clear about: it is a ceiling on catalog *operations*, not on data volume, because no
+row of the lakehouse passes through SQLite.
+
+The residual risk is a hang rather than an error. `ClientPoolImpl.run` blocks when the
+pool is empty, so an Iceberg code path that borrowed a second connection while holding
+the first would wait for itself. None of the paths this project exercises does, across
+the runs above, but a pool of one is the configuration where that bug would appear as
+a stuck query rather than as contention. Moving to Postgres is the fix if it ever
+does, and the connection string is the only thing that would change.
