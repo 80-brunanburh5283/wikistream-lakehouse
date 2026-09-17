@@ -124,6 +124,11 @@ ignore = [
 # Tests document themselves through their names; scripts are CLIs and print.
 "tests/**" = ["D", "ANN", "ARG", "S101"]
 "scripts/**" = ["T20", "D103"]
+# The restart proof runs for minutes and narrates each step as it happens: a test
+# that prints nothing for five minutes cannot be told from a hung one, and its
+# transcript is what docs/correctness.md quotes. That is why `make test-e2e` runs
+# pytest with `-s`.
+"tests/e2e/**" = ["T20"]
 # A container HEALTHCHECK command. Its stdout is what `docker inspect` shows for
 # an unhealthy container, so printing is the interface, not a leftover debug line.
 "src/wikistream/producer/healthcheck.py" = ["T20"]
