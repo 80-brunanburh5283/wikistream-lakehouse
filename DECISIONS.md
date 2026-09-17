@@ -1474,3 +1474,222 @@ environment variable. Changing `WS_ICEBERG_CATALOG_NAME` without renaming
 `lakehouse.properties` puts the two out of step. That fails immediately and loudly
 on the first Trino query rather than producing wrong results, and the file is named
 after the value precisely so the connection is visible in a directory listing.
+
+---
+
+## ADR-0030 — Dagster observes the streaming half; it does not run it
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+Dagster is the orchestrator, and three of the five things in the ingest path are not
+orchestratable in the sense Dagster means. The producer holds one long-lived HTTP
+connection to Wikimedia. The bronze and silver jobs are Spark Structured Streaming
+queries with checkpoints, running until stopped. For all three, "materialise" has no
+meaning: there is no run that starts, produces a table and finishes.
+
+But leaving them out of the asset graph would break the graph. The marts are built by
+dbt from `silver.edits`, so a lineage that begins at silver starts halfway through the
+pipeline and says nothing about where the data came from — which is most of what an
+orchestrator is for here.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Wrap each streaming query in an asset that submits `spark-submit` and returns | The asset would go green the moment the query started and stay green after it died. It would also make Dagster the supervisor of a process Compose already restarts, with two restart policies disagreeing about who owns the query. |
+| Give the streaming jobs a schedule and run them in bounded windows | Turns a streaming pipeline into a micro-batch one to satisfy the orchestrator. The restart-idempotency proof — kill mid-flight, restart, no duplicates — is about a continuous query; scheduling it away would delete the thing this repository exists to demonstrate. |
+| Leave them out of the graph entirely | The dbt source becomes a root with no parent. Nothing then connects Kafka to the marts, and the lineage diagram in the UI stops being evidence of anything. |
+| Model them as external assets and observe them | Chosen. |
+
+### Decision
+
+The producer, the Kafka topic, `bronze.events`, `silver.edits` and `silver.quarantine`
+are `AssetSpec`s with no compute — external assets. A single
+`@multi_observable_source_asset` (`lakehouse_state`, `can_subset=True`) queries Trino
+and Kafka for the row count, the newest event time and the topic's high watermarks,
+and yields an `ObserveResult` per table.
+
+Each observation's data version is the row count, `DataVersion(str(rows))`. That is
+what makes the arrangement useful rather than decorative: Dagster compares an
+observed asset's data version against the version its downstream consumed, so the
+moment silver grows, every dbt mart shows as stale in the UI — without Dagster having
+any part in writing silver.
+
+### Consequence
+
+Stopping Dagster does not stop the pipeline. It stops the pipeline being watched,
+which is the honest description of what an observability layer over a streaming
+system is.
+
+Two things follow that are easy to get wrong. `AssetSelection.all()` selects only
+*materializable* assets, so it silently excludes all five of these — which is why
+`make dagster-observe` names a job rather than selecting everything, and why the
+Makefile target that used `--select '*'` was deleted rather than fixed. And an
+observation is not a materialisation, so freshness cannot be asserted with
+`build_last_update_freshness_checks`: that measures the age of the last observation
+event, which stays fresh on a dead pipeline as long as the observation keeps running.
+`silver_edits_are_fresh` measures `max(event_time)` against the wall clock instead.
+
+---
+
+## ADR-0031 — Each engine maintains the tables it writes
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+Iceberg tables need compaction and snapshot expiry. This project has two writers:
+Spark writes bronze and silver from the streaming jobs, dbt-through-Trino writes the
+gold marts. `scripts/maintain_tables.py` already handles bronze and silver through
+Spark's `rewrite_data_files` and `expire_snapshots` procedures, run by `make maintain`.
+
+The gold tables were unmaintained, and they are the ones that need it most often: the
+two incremental marts rewrite rows on every `dbt build`, so a fifteen-minute schedule
+produces a steady stream of small delete files and snapshots.
+
+The question is which process does it. Dagster is the obvious owner of a scheduled
+maintenance job, and the Dagster container has no Spark in it.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Mount the Docker socket into the Dagster container and `docker exec` into Spark | Hands the container that launches arbitrary runs full control of the daemon, which is root on the host. It is also unvalidatable in CI, so the one part of the stack with a privilege-escalation shape would be the part no test covers. |
+| Add Spark to the Dagster image and compact from there | A second 1.5 GB image and a second Spark driver competing for the same 10 GB, in order to write tables that were written through Trino. |
+| Run the compaction inside a Spark session that is also running the silver stream | Two writers on the same table, one of them rewriting files the other is committing against. Iceberg resolves that with a commit conflict and a retry, which is correct and is still a fight this project can simply not have. |
+| Compact the gold tables through Trino, from Dagster | Chosen. |
+
+### Decision
+
+`gold_table_maintenance` is a Dagster asset that runs
+`ALTER TABLE ... EXECUTE optimize` and
+`ALTER TABLE ... EXECUTE expire_snapshots(retention_threshold => '7d')` through the
+Trino resource, once a day at 03:00 UTC, for each dbt model materialised as a table.
+The table list is read from the dbt manifest, not written down, so a new mart is
+maintained without a Python change.
+
+Bronze and silver stay with Spark and `make maintain`. Each engine maintains what it
+writes, and neither reaches into the other's tables.
+
+### Consequence
+
+The retention threshold is 7 days and not less, because Trino refuses any value below
+its `iceberg.expire-snapshots.min-retention` default of 7 days rather than clamping
+it. Spark's procedure has no such floor, which is why `make maintain` can demonstrate
+expiry immediately with `MAINTAIN_ARGS="--snapshot-age-hours 0"` and this job cannot.
+
+The job is on its own schedule and its own cost class, one run at a time, because
+rewriting data files through a 2 GB coordinator while `build_marts` is running is the
+one way this stack can make Trino thrash.
+
+---
+
+## ADR-0032 — Attach multi-parent singular tests with `meta.dagster.ref`
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+`enable_asset_checks` turns every dbt test into a Dagster asset check, and for
+generic tests it is exact: the test knows the node it is attached to. For a singular
+test — a `.sql` file that must return no rows — dagster-dbt has to guess, and
+`get_asset_check_key_for_test` in `dagster_dbt/asset_utils.py` guesses by counting
+upstream refs: exactly one parent means the check goes on that parent, and more than
+one means it goes nowhere.
+
+Two of the four singular tests here have two parents, because that is what makes them
+worth writing. `assert_minute_mart_never_overcounts` compares the mart against
+`stg_edits`; `assert_dim_wikis_primary_domain_was_observed` recounts the dimension's
+domains straight off the staging view. A test that reads only the model it is testing
+can only restate the model.
+
+Nothing fails when the guess comes up empty. Both tests still run under `dbt build`
+and still fail the build when they should. They are simply attached to no asset, so
+the UI shows 59 checks where the project has 61, and the two most interesting
+assertions are the missing ones.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Rewrite both tests to read one model each | Deletes the independent yardstick, which is the entire assertion. A mart compared against itself is a tautology. |
+| Reimplement them as hand-written Dagster checks in Python | Two copies of the same SQL, in two languages, to be kept in step by nobody. |
+| Accept the gap and note the count | The count is what a reviewer reads. "61 dbt tests, 59 of them visible" is a footnote nobody will find at the moment it matters. |
+| Name the asserted model with `meta.dagster.ref` | Chosen. |
+
+### Decision
+
+Each of the two tests carries a config block naming the model the assertion is
+*about*:
+
+```sql
+{{ config(meta={'dagster': {'ref': {'name': 'mart_edits_per_minute'}}}) }}
+```
+
+The other `ref` is the yardstick it is measured against, and stays unnamed. Every dbt
+test in the manifest now maps to an asset check, which
+`test_every_dbt_test_becomes_an_asset_check` in `tests/unit/test_dagster_lineage.py`
+asserts by name rather than by count.
+
+### Consequence
+
+The hint is one line in a file a reader is already looking at, and each of the two
+carries a comment saying why it is there.
+
+The failure it replaces has a sibling that is worth naming, because it was measured
+rather than assumed: change the hint to name a model that does not exist — a typo, or
+a model since renamed — and dagster-dbt drops the check entirely rather than
+attaching it to a missing key. `dagster definitions validate` still reports success.
+So neither Dagster nor dbt will tell anyone, and the test above is the only thing that
+notices; that is why the mapping is asserted in the suite rather than described in a
+comment.
+
+---
+
+## ADR-0033 — SQLite for the Dagster instance, and no separate code server
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+A Dagster deployment has three moving parts to choose: where run and event storage
+lives, how runs are launched, and how the code location is served. Dagster's
+documented production answer is Postgres storage, a container per code location
+served over gRPC, and a run launcher that starts a container per run.
+
+This project's constraint is that `make up` must bring the whole stack up inside
+10 minutes on a 12 GB machine that is already running Kafka, MinIO, a Spark driver
+and a 2 GB Trino coordinator.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Postgres for run and event storage | Another stateful container and another JVM-free-but-not-free resident set, to absorb the event stream of three short jobs. It would also make `make up` wait on one more healthcheck before the UI is reachable. |
+| A `dagster api grpc` code-location container | The recommended isolation, and its benefit is that a code-location import error cannot affect the webserver. That is worth a container in a deployment where code changes without the image changing. Here the code and the image are one artefact, and a third long-lived Python process is memory this machine does not have. |
+| A container-per-run launcher (`DockerRunLauncher`) | Needs the Docker socket mounted into the webserver and the daemon. Rejected for the same reason as in ADR-0031: it makes the process that launches arbitrary runs able to control the host's daemon. |
+| SQLite, the default run launcher, code loaded in-process with `-m` | Chosen. |
+
+### Decision
+
+Two containers from one image. Both load the code location in-process with
+`-m wikistream_dagster.definitions`, and both mount the same named volume at
+`$DAGSTER_HOME`, so they share one SQLite database and one `dagster.yaml`. Runs are
+launched as subprocesses by the default run launcher, and the run queue is capped at
+one concurrent run — the cap is about Trino's heap, not about Dagster.
+
+### Consequence
+
+The whole control plane costs two Python processes and one SQLite file, and adds no
+container that `make up` has to wait on beyond the two it starts.
+
+What is given up is real and belongs in the README's limitations rather than being
+glossed: an import error in `definitions.py` shows up as a failed code location in
+the UI instead of being isolated in another container, SQLite means one writer at a
+time and would not survive a second daemon, and a run executes beside the process that
+launched it — so a run launched from the UI runs in the webserver container and a
+scheduled run runs in the daemon container. On one machine that distinction has no
+consequence. On several it would be the first thing to change, and the change is
+`dagster.yaml` plus one Compose service, not a rewrite.

@@ -164,6 +164,32 @@ def test_the_streaming_half_is_not_materializable(asset_graph):
         assert not asset_graph.get(key).is_materializable, key
 
 
+def test_every_dbt_test_becomes_an_asset_check(manifest):
+    """No dbt test may run without being attached to something in the UI.
+
+    dagster-dbt infers the asset a singular test asserts about by counting the test's
+    upstream refs, and a test with two of them is attached to nothing — silently. It
+    still runs under `dbt build` and still fails the build; it just stops being
+    visible. The two most interesting tests in this project have two refs each, for
+    the reason each of them states, and both carry a `meta.dagster.ref` hint to close
+    the gap (DECISIONS.md ADR-0032).
+
+    Asserted as a mapping rather than as a count, because a count would also be
+    satisfied by a hint that names the wrong model.
+    """
+    from wikistream_dagster.dbt_project import wikistream_dbt_assets
+
+    attached = {spec.name for spec in wikistream_dbt_assets.check_specs}
+    declared = {
+        node["name"] for node in manifest["nodes"].values() if node["resource_type"] == "test"
+    }
+    assert declared, "no tests in the manifest — has `dbt parse` run?"
+
+    assert declared - attached == set(), (
+        f"dbt tests attached to no asset: {sorted(declared - attached)}"
+    )
+
+
 def test_every_gold_model_is_in_the_gold_group(asset_graph, manifest):
     """One group for the dbt half, so the UI's grouping matches the warehouse's."""
     for node in manifest["nodes"].values():
