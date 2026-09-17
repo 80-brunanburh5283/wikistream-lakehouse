@@ -90,7 +90,13 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     # first invocation rather than at start-up. Redirected to scratch: these are
     # per-invocation artefacts, and dagster-dbt already keeps the ones worth
     # keeping — it streams run_results into the event log.
-    WS_DBT_TARGET_PATH=/tmp/dbt-target \
+    #
+    # DBT_TARGET_PATH is dbt's own variable rather than a WS_-prefixed one because
+    # three things have to agree on it: dbt itself, the DbtProject in
+    # wikistream_dagster.dbt_project, and dagster-dbt, which roots its
+    # per-invocation target directory at whatever this variable says. Nothing
+    # passes it between them, so it has to be the name they all already read.
+    DBT_TARGET_PATH=/tmp/dbt-target \
     DBT_LOG_PATH=/tmp/dbt-logs \
     WS_LOG_JSON=true
 

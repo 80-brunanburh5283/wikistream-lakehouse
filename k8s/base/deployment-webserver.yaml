@@ -133,6 +133,6 @@ spec:
             name: dagster-instance
         - name: scratch
           # Because readOnlyRootFilesystem is true and dbt writes its target
-          # directory and log file under /tmp — see the WS_DBT_TARGET_PATH and
+          # directory and log file under /tmp — see the DBT_TARGET_PATH and
           # DBT_LOG_PATH values in docker/dagster.Dockerfile.
           emptyDir: {}

@@ -27,7 +27,7 @@
 set -euo pipefail
 
 PROJECT_DIR="${WS_DBT_PROJECT_DIR:-/opt/dbt}"
-TARGET_PATH="${WS_DBT_TARGET_PATH:-/tmp/dbt-target}"
+TARGET_PATH="${DBT_TARGET_PATH:-/tmp/dbt-target}"
 LOG_PATH="${DBT_LOG_PATH:-/tmp/dbt-logs}"
 
 if [[ ! -f "${PROJECT_DIR}/dbt_project.yml" ]]; then

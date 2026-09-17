@@ -51,7 +51,14 @@ PROJECT_DIR = Path(os.environ.get("WS_DBT_PROJECT_DIR", str(_REPO_DBT_DIR)))
 #: this at `/tmp`: dagster-dbt writes a fresh target directory per invocation, so a
 #: read-only project directory with the default `target` path fails partway into
 #: the first run rather than at start-up.
-TARGET_PATH = Path(os.environ.get("WS_DBT_TARGET_PATH", "target"))
+#:
+#: `DBT_TARGET_PATH` and not a `WS_`-prefixed name, because this value has to reach
+#: dagster-dbt as well as this `DbtProject`, and nothing passes it there: its
+#: `_get_unique_target_path` reads `DBT_TARGET_PATH` from the environment and puts
+#: the per-invocation directory underneath it. Naming the variable anything else
+#: makes `dbt build` under Dagster write to `<project_dir>/target` regardless of
+#: what this says, which on the read-only mount is `OSError: Read-only file system`.
+TARGET_PATH = Path(os.environ.get("DBT_TARGET_PATH", "target"))
 
 dbt_project = DbtProject(
     project_dir=PROJECT_DIR,
@@ -151,6 +158,8 @@ def wikistream_dbt_assets(context: AssetExecutionContext, dbt: DbtCliResource) -
 
     `--target-path` is not passed: `DbtCliResource` sets it per invocation so two
     concurrent runs cannot overwrite each other's `run_results.json`, which is the
-    artefact a failed run is diagnosed from.
+    artefact a failed run is diagnosed from. It roots that per-invocation directory
+    at `$DBT_TARGET_PATH`, which is why `TARGET_PATH` above reads that variable and
+    not one of this project's own.
     """
     yield from dbt.cli(["build"], context=context).stream()

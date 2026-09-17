@@ -9,6 +9,10 @@ than loudly. Three examples, all of which these tests would have caught:
 * The dbt project is mounted read-only. If the target path or the log path is left
   pointing inside it, dbt fails partway into the first invocation rather than at
   start-up, so the container passes its healthcheck and the first mart build dies.
+  That is not hypothetical: the variable was originally named `WS_DBT_TARGET_PATH`,
+  which put it outside the mount and out of dagster-dbt's sight at the same time, so
+  `dbt build` went back to the default and the mart build died with
+  `OSError: Read-only file system`.
 * `make dagster-marts` names a job by string. The previous version of that target
   executed `asset_checks_job`, which has never existed in this project.
 
@@ -102,11 +106,33 @@ def test_the_dbt_project_is_read_only_and_dbt_writes_elsewhere(compose, dockerfi
         mount = _mount(compose["services"][name], project_dir)
         assert mount == f"./dbt:{project_dir}:ro", name
 
-    for variable in ("WS_DBT_TARGET_PATH", "DBT_LOG_PATH"):
+    for variable in ("DBT_TARGET_PATH", "DBT_LOG_PATH"):
         path = _env(dockerfile, variable)
         assert not path.startswith(project_dir), (
             f"{variable} is {path}, which is inside the read-only mount"
         )
+
+
+def test_the_target_path_uses_the_variable_dagster_dbt_reads(dockerfile) -> None:
+    """Being outside the read-only mount is not enough; the name has to be dbt's.
+
+    dagster-dbt is never handed the `DbtProject`'s `target_path`. It reads
+    `DBT_TARGET_PATH` from the environment and creates its per-invocation directory
+    underneath whatever that says, defaulting to a relative `target`. So a correct
+    path under a `WS_`-prefixed name is invisible to it: `dbt parse` at start-up
+    writes to /tmp, the container goes healthy, and `dbt build` writes to the
+    read-only mount and fails.
+    """
+    source = (REPO_ROOT / "src" / "wikistream_dagster" / "dbt_project.py").read_text()
+    entrypoint = (REPO_ROOT / "docker" / "dagster" / "entrypoint.sh").read_text()
+
+    assert 'os.environ.get("DBT_TARGET_PATH"' in source
+    for name, text in (
+        ("dbt_project.py", source),
+        ("Dockerfile", dockerfile),
+        ("entrypoint", entrypoint),
+    ):
+        assert "WS_DBT_TARGET_PATH" not in text, name
 
 
 def test_the_dbt_service_still_mounts_the_project_writable(compose) -> None:
