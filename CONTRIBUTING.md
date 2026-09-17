@@ -49,9 +49,11 @@ Unit tests must stay offline and fast. If a test needs Kafka, MinIO or Spark, it
 is an integration test and belongs behind the `integration` marker so that
 someone without Docker running can still get a useful signal from `pytest`.
 
-Two targets talk to the public internet, and only these two: `make smoke-live`,
-which checks the source is reachable, and `make test-e2e`, which feeds its scratch
-topic from the live stream. Everything else runs against captured fixtures.
+Three targets talk to the public internet, and only these three: `make smoke-live`,
+which checks the source is reachable; `make test-e2e`, which feeds its scratch topic
+from the live stream; and `make query-duckdb`, whose first run downloads DuckDB's
+`httpfs` and `iceberg` extensions from extensions.duckdb.org and is offline after
+that. Everything else runs against captured fixtures and local containers.
 
 ## Before you open a pull request
 
