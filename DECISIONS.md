@@ -1253,3 +1253,224 @@ The cost is that the test reaches into Spark's checkpoint layout, which is inter
 If Spark renames those directories the test breaks — loudly, at the `rm`, not
 silently. `_numeric_entries` and `_batch_end_offsets` are commented with the layout
 they assume for that reason.
+
+---
+
+## ADR-0026 — Ship no dbt packages; write the one generic test that is missing
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+The gold layer needs a uniqueness assertion on a composite grain: `(event_minute,
+wiki, change_type)` for the minutely mart, `(event_hour, wiki)` for the hourly one,
+and two of them for the top-N mart. dbt core's `unique` test takes a single column,
+so the usual answer is `dbt_utils.unique_combination_of_columns`, which means a
+`packages.yml` and a `dbt deps` step.
+
+That is the only thing this project would use `dbt_utils` for. Everything else the
+marts assert is either a core generic test — `unique`, `not_null`,
+`accepted_values`, `relationships` — or a singular test whose logic is specific
+enough that no package could supply it (`assert_top_pages_rank_is_contiguous` is
+not a general-purpose idea).
+
+`dbt deps` fetches from `hub.getdbt.com` at build time. This stack has one
+deliberate network dependency, the Wikimedia stream, and `make dbt-run` on a fresh
+clone reaching a second host to run four tests is a failure mode bought for very
+little.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Add `dbt_utils` to `packages.yml` and run `dbt deps` in the image build | Pulls several hundred macros to get one test, pins a second dependency tree that has to resolve against dbt-trino on every upgrade, and makes a clone-and-run depend on a package registry being up. |
+| Vendor the whole of `dbt_utils` into `dbt/macros/` | Thousands of lines nobody in the repo wrote, that a reader has to skip past, and that quietly stop matching upstream the day after they are copied. |
+| Skip the composite test and assert `unique` on a concatenated surrogate key | Needs a column in every mart that exists only to be tested, and concatenation makes uniqueness depend on the delimiter never appearing in a page title. It also fails silently on nulls. |
+| Assert nothing about the composite grain | The grain *is* the correctness property of an incremental model. An incremental key typo produces duplicate rows on the second run and nothing else notices. |
+| Write the test | Chosen. |
+
+### Decision
+
+`dbt/tests/generic/unique_combination_of_columns.sql` — ten lines of SQL: group by
+the column list, count, return the groups with more than one row. The name is
+deliberately the same as `dbt_utils`'. If a future need ever justifies the package,
+the migration is to delete this file and add the `dbt_utils.` prefix at four call
+sites, with no change to the assertion.
+
+`packages.yml` does not exist. `dbt_packages` stays in `clean-targets` anyway, so
+the day it does exist `dbt clean` already knows about it.
+
+### Consequence
+
+`make dbt-run` on a fresh clone touches no host but Trino, and the dbt image build
+has one dependency resolver in it rather than two. The test is in the repository
+where a reviewer reads it, next to the models it guards.
+
+The cost is real and worth naming: the next generic test this project needs will
+also have to be written by hand, and if `dbt_utils` fixes a bug in its version of
+this test, nothing here learns about it. That trade is acceptable at four call
+sites and would not be at forty.
+
+---
+
+## ADR-0027 — One `gold` schema; the layer lives in the model name
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+The dbt convention is a schema per layer, configured with `+schema: staging` and
+`+schema: marts` in `dbt_project.yml`. dbt *appends* that value to the target
+schema rather than replacing it, so with a `gold` target the result is
+`gold_staging` and `gold_marts`.
+
+Under Trino's Iceberg connector a schema is a catalog namespace, and namespaces
+here are created by `scripts/init_tables.py` — `bronze`, `silver`, `gold` — before
+anything queries the lakehouse. dbt would create its two at run time.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| `+schema: staging` / `+schema: marts`, giving `gold_staging` and `gold_marts` | The catalog's namespace list then depends on whether dbt has ever run, so `make init-tables` stops being a complete description of the lakehouse layout and two tools own overlapping parts of it. The names also say "gold" twice: `lakehouse.gold_marts.mart_edits_per_minute`. |
+| A separate `analytics` catalog for dbt output | Two catalogs over one warehouse root, and the marts stop being reachable from the same three-part name the rest of the project uses. Buys isolation this stack has no use for. |
+| Staging views in `silver`, marts in `gold` | Puts dbt-managed objects inside the namespace Spark writes, where a `drop schema cascade` during a reset would take the source tables with them. |
+| Everything in `gold` | Chosen. |
+
+### Decision
+
+Every model dbt builds lands in `gold`. The layer is carried by the model name —
+`stg_`, `dim_`, `mart_` — and by the `models/` subdirectory, both of which appear
+in `dbt ls`, in the docs site, and in the lineage graph. `init_tables.py` remains
+the single place that creates namespaces.
+
+### Consequence
+
+`lakehouse.gold.mart_edits_per_minute` is the name in the marts, in
+`scripts/query_trino.sh`, and in the README, with nothing to translate between
+them. Dropping and recreating the whole analytics layer is one `drop schema
+lakehouse.gold cascade` away, and it cannot reach the source tables.
+
+What is given up is dbt's schema-level grant and permission story, which is the
+real reason the convention exists. This stack has one user and no authentication
+(see `SECURITY.md`), so there is nothing to grant. On a shared warehouse the split
+would earn its keep and this ADR would be the wrong decision.
+
+---
+
+## ADR-0028 — Choose each mart's incremental strategy from the shape of its aggregate
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+Five gold models over a table that is still being written to. They are not the same
+shape:
+
+- `mart_edits_per_minute` and `mart_bot_vs_human_hourly` are additive aggregates at
+  a fixed grain. A bucket's value depends only on the rows in that bucket.
+- `mart_top_pages_hourly` is a top-N. Which rows belong in the output depends on how
+  the other rows in the bucket compare, so a row can stop belonging.
+- `dim_wikis` and `mart_pipeline_health` are a few hundred rows over the whole
+  history.
+
+Every incremental run also lands mid-bucket. A run at 10:00:30 sees half of the
+10:00 minute; the next run sees all of it. Whatever strategy is used has to say what
+happens to that partial bucket, and the answer decides whether `count(distinct
+editor)` in these marts is a real number or a lie.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| `append` everywhere, filtering `> max(bucket)` | Writes the partial boundary bucket once partial and never corrects it, so half a minute of activity is permanently missing. Filtering `>=` instead makes it worse: the bucket is then written twice and every count doubles. |
+| `merge` everywhere | Correct for the additive marts, wrong for top-N. When a page falls out of the ten, merge has no row to update and no reason to delete: the stale row stays, the hour ends up with eleven "top ten" entries, and two of them claim the same rank. |
+| `delete+insert` everywhere | Correct, but dbt-trino materialises a temp *table* for this strategy rather than the view it uses for merge, so every additive mart would pay a full write of its incremental slice to buy a delete it does not need. |
+| Full rebuild everywhere | Simplest and always right, and it re-reads the entire silver table once per model per run — minutes on a laptop, growing with the data. It also skips the part of the problem worth demonstrating. |
+| One strategy per shape | Chosen. |
+
+### Decision
+
+| Model | Strategy | Key | Why this one |
+|---|---|---|---|
+| `mart_edits_per_minute` | `merge` | `(event_minute, wiki, change_type)` | Additive; the boundary bucket's row is overwritten in place. |
+| `mart_bot_vs_human_hourly` | `merge` | `(event_hour, wiki)` | Same shape, coarser grain. |
+| `mart_top_pages_hourly` | `delete+insert` | `event_hour` | The affected hours have to be emptied before they are rewritten, because membership of the top ten is not stable. |
+| `dim_wikis` | table | — | Cumulative shares over a few hundred rows; an incremental version would re-read everything anyway. |
+| `mart_pipeline_health` | table | — | Same, plus a full outer join across two clocks that an incremental filter would have to be applied to twice. |
+
+The second half of the decision is the filter. Every incremental model reads
+`>= max(bucket)` from its own target, not `>`. The bucket a previous run stopped
+inside is therefore recomputed from all of its rows and overwritten — which is what
+makes `merge` mandatory rather than merely convenient, and what makes a distinct
+count in these marts correct.
+
+For `mart_top_pages_hourly`, `unique_key='event_hour'` names the delete predicate,
+not a key: dbt-trino renders it as `delete from target where (event_hour) in (select
+event_hour from tmp)`, and the target legitimately holds up to ten rows per hour per
+wiki. The ordering inside `row_number()` breaks ties on `page_title` so that
+recomputing an hour produces the same table rather than a differently shuffled one.
+
+### Consequence
+
+Each incremental run re-reads one bucket of data it has already processed. That is
+the price of the boundary being correct, and it is bounded — one minute or one hour
+of the firehose, not a growing tail.
+
+Every incremental read carries two predicates that look redundant. The bucket
+predicate is for correctness; the `event_date >=` beside it exists only so Iceberg
+can prune partitions, because Trino cannot infer that a truncated timestamp in a
+view is related to the partition column underneath it. Both are scalar subqueries
+rather than a cross join to the same aggregate: Trino evaluates a scalar subquery
+once and pushes a constant into the scan, where the cross join would need dynamic
+filtering and would prune nothing.
+
+`mart_events = silver_events` is not an invariant and no test asserts it — silver
+keeps growing while the marts are built, and late data lands in a bucket already
+written. `mart_events > silver_events` has no legitimate cause, so
+`assert_minute_mart_never_overcounts` asserts that direction only. A one-sided test
+that is true is worth more than a two-sided one that has to be marked `warn`.
+
+---
+
+## ADR-0029 — Name the Trino catalog `lakehouse`, matching Spark's
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+Trino takes a catalog's name from its properties filename; Spark takes it from the
+`spark.sql.catalog.<name>` property prefix. Both here point at the same Iceberg REST
+catalog over the same MinIO bucket, and nothing makes them agree. The Trino Iceberg
+connector's documentation and nearly every example call the catalog `iceberg`.
+
+If they disagree, one table has two fully-qualified names: `iceberg.silver.edits` in
+the Trino CLI and `lakehouse.silver.edits` in Spark. A query copied from one to the
+other fails with `Catalog 'lakehouse' does not exist`, which reads like a broken
+configuration rather than a naming difference.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Trino `iceberg`, Spark `lakehouse` — each engine's convention | Two names for one table. Every snippet in the README, `docs/`, and the runbooks would have to say which engine it is for, and the failure when someone gets it wrong points at the wrong thing. |
+| Both `iceberg` | Names the file format rather than the store. It also reads as though there is a non-Iceberg copy of `silver` somewhere, and leaves nothing to distinguish a second Iceberg catalog with different settings if one is ever added for comparison. |
+| Both `lakehouse` | Chosen. |
+
+### Decision
+
+`lakehouse` on both sides. `docker/trino/catalog/lakehouse.properties` gives Trino
+the name; `WS_ICEBERG_CATALOG_NAME` gives it to Spark, to dbt's profile, to the
+source definition in `_silver__sources.yml`, and to `scripts/query_trino.sh`.
+
+### Consequence
+
+`lakehouse.silver.edits` is one string that works in `spark-sql`, in the Trino CLI,
+in a dbt model, and in the README, so no document has to name an engine before it can
+name a table.
+
+The one seam is that Trino's catalog name comes from a filename and cannot read an
+environment variable. Changing `WS_ICEBERG_CATALOG_NAME` without renaming
+`lakehouse.properties` puts the two out of step. That fails immediately and loudly
+on the first Trino query rather than producing wrong results, and the file is named
+after the value precisely so the connection is visible in a directory listing.

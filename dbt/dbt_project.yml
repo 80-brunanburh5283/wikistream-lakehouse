@@ -7,9 +7,10 @@
 #     `gold` namespace, and the `stg_` / `dim_` / `mart_` prefixes carry the
 #     layer. The alternative — dbt's `+schema:` config, which *appends* to the
 #     target schema and would give `gold_staging` — means dbt creating Iceberg
-#     namespaces at run time, and a `make clean` then leaves namespaces behind
-#     that `init_tables.py` does not know to recreate. The layering is legible
-#     from the names and from models/ directory structure either way.
+#     namespaces at run time, so what namespaces the catalog holds depends on
+#     whether dbt has run and `make init-tables` stops describing the whole
+#     layout. The layering is legible from the names and from the models/
+#     directory structure either way. See DECISIONS.md ADR-0027.
 #
 #  2. **No packages.yml.** dbt_utils would be the obvious addition, and it is
 #     left out on purpose: every generic test this project needs is in dbt core

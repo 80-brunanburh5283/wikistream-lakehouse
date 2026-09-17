@@ -31,6 +31,8 @@
     could swap places between runs, and the boundary hour is recomputed on every
     run — so the table's contents would change with no change in the data, and
     "re-running produces the same table" would stop being true.
+
+    The strategy-per-shape reasoning across all five marts is DECISIONS.md ADR-0028.
 */
 
 {{ config(
