@@ -17,6 +17,15 @@ sources:
           key constraint, so that uniqueness is a property of the MERGE that
           writes the table rather than something the catalog enforces — see
           docs/correctness.md and `make verify-no-duplicates`.
+        # Ties this dbt source to the Dagster asset the Spark job writes, so the
+        # lineage graph is continuous from Kafka through to the marts instead of
+        # starting again here. The key must match `SILVER_EDITS_KEY` in
+        # src/wikistream_dagster/keys.py exactly; nothing errors if it does not,
+        # the graph just quietly splits in two, so
+        # tests/unit/test_dagster_lineage.py compares the two spellings.
+        meta:
+          dagster:
+            asset_key: [lakehouse, silver, edits]
         # `dbt source freshness` compares max(ingested_at) against these
         # thresholds. Deliberately generous relative to the 30-second micro-batch
         # trigger: a stale source here means the streaming job is not running,
@@ -49,6 +58,9 @@ sources:
           Events that failed a validation rule, with the reason and the raw
           frame. Empty is the expected state; a non-empty quarantine is a
           signal, not a failure of the pipeline.
+        meta:
+          dagster:
+            asset_key: [lakehouse, silver, quarantine]
         columns:
           - name: failure_reason
             description: "Which rule rejected the event, from `wikistream.quality.expectations`."

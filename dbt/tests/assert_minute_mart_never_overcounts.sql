@@ -25,6 +25,12 @@
     catches duplicate buckets, this one catches inflated counts within a bucket.
 */
 
+{#-
+    Two `ref`s, so Dagster needs telling which asset this asserts about. See
+    DECISIONS.md ADR-0032.
+-#}
+{{ config(meta={'dagster': {'ref': {'name': 'mart_edits_per_minute'}}}) }}
+
 with silver_by_minute as (
     select
         event_minute,

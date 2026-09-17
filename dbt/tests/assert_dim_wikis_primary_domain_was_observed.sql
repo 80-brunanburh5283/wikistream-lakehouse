@@ -14,6 +14,15 @@
     a bug in that CTE shows up as a disagreement instead of cancelling out.
 */
 
+{#-
+    This test reads two models, so Dagster cannot infer which asset it is an
+    assertion about, and without this hint it silently becomes a test that runs
+    under `dbt build` but is attached to nothing in the UI. `meta.dagster.ref`
+    names the model the assertion is *about* — `stg_edits` is only the independent
+    yardstick it is measured against. See DECISIONS.md ADR-0032.
+-#}
+{{ config(meta={'dagster': {'ref': {'name': 'dim_wikis'}}}) }}
+
 with observed_pairs as (
     select distinct
         wiki,
