@@ -201,3 +201,215 @@ lock makes it free thereafter.
 bytes. `uv run` means no target in the `Makefile` depends on a virtualenv being
 activated. Contributors need `uv` installed, which is one extra prerequisite —
 documented in `CONTRIBUTING.md`.
+
+---
+
+## ADR-0005 — Derive the event schema from a capture, and declare it explicitly
+
+### Context
+
+The pipeline needs a Spark schema for `recentchange` events. Two questions had to
+be answered: where the field list comes from, and whether Spark should infer it.
+
+I captured 500 live events (`tests/fixtures/recentchange_sample.jsonl`,
+2026-09-17) and profiled them before writing any schema. The capture disagreed
+with the field list I had been working from: `server_script_path`, `notify_url`
+and five `log_*` fields are sent by the stream and were absent from my notes.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| Runtime schema inference | Inference samples data, so the table's column set becomes a function of when the job started. With `log` events at 2.8% of traffic, a job starting in a quiet minute can infer a schema with no `log_type` column at all. Spark also requires `spark.sql.streaming.schemaInference` to be switched on before it will infer on a stream, which is a fair warning. |
+| Schema from the upstream documentation | Measurably incomplete: it omits seven fields the stream actually sends. |
+| Explicit schema derived from a capture | Chosen. |
+
+### Decision
+
+`RECENTCHANGE_SCHEMA` in `src/wikistream/streaming/schema.py` is written out by
+hand, with every type and nullability decision traceable to a measured rate in
+the capture. `tests/unit/test_schema.py` compares the declared field set against
+the captured field set in both directions and fails on either kind of drift.
+
+Four integer widths were decided by measurement rather than by guess. In a single
+500-event sample, `id` reached 3,468,178,745, `revision.new` reached
+2,546,877,183 and `meta.offset` reached 6,524,211,441 — all past the int32
+ceiling of 2,147,483,647. Spark's JSON parser returns null on overflow instead of
+raising, so `IntegerType` on those columns would have deleted the revision ids of
+the busiest wikis while every row count and every health check stayed green.
+
+### Consequence
+
+Upstream adding a field breaks a test instead of silently widening the table. The
+cost is that adding a field is a code change, which is the trade I want: bronze
+also retains the raw payload, so a field discovered late is recoverable by
+backfill rather than lost.
+
+---
+
+## ADR-0006 — Keep the polymorphic `log_params` as raw JSON text
+
+### Context
+
+`log_params` is not one shape. In the captured `log` events it is a JSON object
+for `upload`, `abusefilter` and `newusers` (12 of 14) and an empty JSON array for
+`thanks` and `delete` (2 of 14). The object's own values are mixed types —
+`{"action": "edit", "filter": "1245", "actions": "disallow", "log": 45144167}`
+holds both strings and numbers.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| `StructType` with the union of observed keys | Cannot also be an array. Would need a new key every time a log type appears that the capture missed, and there are dozens of MediaWiki log types. |
+| `MapType(StringType, StringType)` | Cannot hold the array form, and coerces `45144167` to `"45144167"` — a silent type change inside a field whose whole purpose is fidelity. |
+| Drop the field | It is the only place the detail of a log action lives. |
+| `StringType`, holding the raw JSON | Chosen. |
+
+### Decision
+
+`log_params` is `StringType`. Declaring a string against a JSON object or array
+is deliberate, not a mistake: Spark's `JacksonParser`, given a `StringType`
+target and a JSON structure, copies the raw JSON back out as text. The column
+therefore holds the original substring losslessly and a caller who wants
+structure can parse it with `from_json` at read time, choosing a shape
+appropriate to the log type they are asking about.
+
+This is asserted rather than assumed —
+`tests/integration/test_schema_parses.py` round-trips every `log_params` value
+in the capture through real Spark 4.0.4, including the empty-array form and the
+mixed-type object.
+
+### Consequence
+
+Querying inside `log_params` needs an explicit parse in SQL. Acceptable: log
+events are 2.8% of traffic and none of the marts read this field. The alternative
+was a column that is null exactly when it is interesting.
+
+---
+
+## ADR-0007 — Parse permissively and quarantine explicitly
+
+### Context
+
+Malformed records must not stop a streaming query, and unusable records must not
+enter the deduplicated table. I probed what `from_json` actually does before
+designing this, and two of the three behaviours were the opposite of my guess.
+
+Verified against Spark 4.0.4:
+
+1. A malformed payload does **not** produce a null struct. `from_json("{not json}")`
+   returns an ordinary struct whose every field happens to be null. Only a
+   zero-length string yields an actual null struct.
+2. Naming a corrupt-record column makes the parser store the offending raw text
+   in it.
+3. `mode=FAILFAST` raises and kills the query.
+
+Finding (1) matters most: `parsed IS NULL` reads like a corruption check and is
+not one. A quarantine predicate built on it would admit garbage as a row of
+nulls.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| `FAILFAST` | One malformed byte on the wire stops ingestion for every wiki. Unacceptable on a stream. |
+| `PERMISSIVE` and test the struct for null | Does not work, per finding (1). This is the bug the probe caught before it was written. |
+| `PERMISSIVE` + corrupt-record column + explicit required-field predicate | Chosen. |
+
+### Decision
+
+`PARSE_SCHEMA` is the declared contract plus a `_corrupt_record` column, parsed
+with `mode=PERMISSIVE`. The sidecar column is kept out of `RECENTCHANGE_SCHEMA`
+so the drift test keeps comparing the declared contract against the wire with no
+locally-invented field to explain away.
+
+Rejection then has two distinguishable reasons, and `silver.quarantine` records
+which one applied:
+
+- **unparseable** — `_corrupt_record` is not null. The bytes were not JSON.
+- **incomplete** — the payload is valid JSON but a field in `REQUIRED_FIELDS`
+  (`meta.id`, `meta.dt`, `meta.domain`) is null. There is no deduplication key,
+  no event time, or no partition key, so the row cannot be placed, ordered or
+  deduplicated.
+
+A single "invalid" flag would conflate the two, and they need different
+responses: the first is a wire or upstream-encoding problem, the second is a
+contract change.
+
+### Consequence
+
+The quarantine table stores the raw payload alongside the reason, so a rejected
+record can be replayed after a fix rather than merely counted. Cost: one extra
+column through the parse step, and a quarantine table that needs its own
+retention policy.
+
+---
+
+## ADR-0008 — Partition Kafka by wiki domain, accepting the skew
+
+### Context
+
+The topic needs a partitioning key. `meta.domain` (the wiki) is the natural
+candidate; round-robin is the alternative.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| Round-robin / no key | Even partitions, but no ordering guarantee for any subject. "The most recent edit to this page" then needs a global sort. |
+| Key by `meta.id` | Perfectly even, and useless — every event is its own key, so ordering is guaranteed for nothing. |
+| Key by `meta.domain` | Chosen, with a measured cost. |
+
+### Decision
+
+Partition by `meta.domain`, giving per-wiki ordering.
+
+The cost is skew, and it is measured rather than hand-waved: in the 500-event
+capture, `commons.wikimedia.org` alone was 31.8% of events, and the top three
+domains were 67.2%. With three partitions, one runs hot. `tests/unit/test_events.py`
+asserts the skew is still above 20% so that this entry cannot quietly go stale.
+
+### Consequence
+
+Accepted, because per-wiki ordering is what makes the silver table's
+last-write-wins semantics meaningful, and because at 40 events/second a hot
+partition is not a throughput problem on a laptop. At scale the fix is a
+composite key (`domain` plus a bucket of `page_id`) which trades strict per-wiki
+ordering for per-page ordering — a better trade at volume, and an unnecessary
+complication here. Named in the README's limitations rather than pretended away.
+
+---
+
+## ADR-0009 — A 10-minute watermark for a sub-second stream
+
+### Context
+
+The silver stream needs a watermark. I measured the input rather than guessing:
+7,234 events over 180 seconds gave a median lag of −0.36 s, p99 of 1.32 s and a
+maximum of 2.74 s, with 98.6% of events arriving inside one second
+(`docs/latency.md`). 82% of the samples were negative, which is clock skew
+between WSL2 and Wikimedia's producers, and is reported rather than corrected.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| 30 seconds (~23x the measured p99) | Sized for the network, not for recovery. On a restart after a two-minute outage, Kafka hands back a backlog whose event times are minutes old, and everything older than 30 s behind the batch maximum is dropped as late. A restart would silently lose most of what it read. |
+| 1 hour | Costs 240,000 events of retained state to protect against an outage length that the 24-hour Kafka retention already bounds, and delays nothing usefully. |
+| 10 minutes | Chosen. |
+
+### Decision
+
+`watermark_minutes = 10`, roughly 450x the measured p99. The watermark is sized
+for restart replay, not for steady-state jitter: it tolerates an outage of up to
+ten minutes with no dropped events.
+
+### Consequence
+
+Spark retains about `40 events/s x 600 s = 24,000` events of deduplication state
+— small enough to be uninteresting on a 12 GB laptop, which is the honest reason
+this trade-off was cheap. An outage longer than ten minutes drops the oldest
+events on restart, and the README says so. On a stream two orders of magnitude
+larger the answer would flip to a tighter watermark plus a correction table for
+late arrivals.
