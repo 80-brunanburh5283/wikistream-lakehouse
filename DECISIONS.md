@@ -655,3 +655,160 @@ comment and `docs/throughput.md` now say gzip won on bytes and why zstd is still
 the default. The unmeasured half — codec CPU — is named as the most significant gap
 on that page instead of being papered over. At 50,000 events/s this decision should
 be reopened, and the reopening starts with the measurement that was skipped here.
+
+---
+
+## ADR-0015 — The Spark base image is the Docker Official one, pinned by digest
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+Phase 4 needs Spark 4.0.4 with the Iceberg runtime, the AWS bundle and the Kafka
+connector available to `spark-submit`. The obvious base image is `apache/spark`,
+published by the project itself, and the obvious pin is the version tag.
+
+The first container built that way would not start:
+
+```
+exec /opt/entrypoint.sh: exec format error
+```
+
+Which reads like an architecture mismatch and is not one. `/opt/entrypoint.sh` in
+that image is **0 bytes**, and an empty file with a shebang-less body is what
+`exec format error` looks like. Overriding the entrypoint got further and then hit
+`ClassNotFoundException: org.apache.spark.launcher.Main` from `spark-submit`
+itself — because `spark-launcher_2.13-4.0.4.jar` is also 0 bytes, and Java's
+`-cp "dir/*"` skips an empty jar silently rather than reporting an I/O error. In
+total **41 of 277 jars** in the published image are zero-length.
+
+Ruled out as local corruption: 906 GB free on the disk, and a fresh
+`docker image rm` plus re-pull reproduced 41 of 277 exactly. The two images side by
+side, with the entrypoint overridden so that the empty `/opt/entrypoint.sh` could
+not mask the count:
+
+```bash
+docker run --rm --entrypoint sh apache/spark:4.0.4-scala2.13-java17-python3-ubuntu \
+  -c 'find /opt/spark/jars -size 0 | wc -l'      # -> 41
+docker run --rm --entrypoint sh spark:4.0.4-scala2.13-java17-python3-ubuntu \
+  -c 'find /opt/spark/jars -size 0 | wc -l'      # -> 0
+```
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| Fix it in the Dockerfile: re-download the 41 jars over the base image | Builds a working image on top of a broken one, and the list of 41 would have to be maintained by hand against every future tag. |
+| Build Spark from source | Hours of build time in a repo whose selling point is that it starts in minutes. |
+| Downgrade to an older `apache/spark` tag | Might work, but pins the project to whichever tag happened to publish cleanly, and gives no way to notice if the next one does not. |
+| `spark:4.0.4-scala2.13-java17-python3-ubuntu` — the Docker Official Images build | Chosen. Same Spark version, same variant name, different publisher and different build pipeline. 0 zero-byte jars; entrypoint 4,735 bytes. |
+
+### Decision
+
+Use the Docker Official Images build, and pin it by **digest as well as tag**:
+
+```dockerfile
+FROM spark:4.0.4-scala2.13-java17-python3-ubuntu@sha256:8fc690e18426aa04ae92e7709c34fdc0be5ea848840e216fa6091ab9436fd37d
+```
+
+The six jars the pipeline adds are downloaded from Maven Central in the build and
+each verified against a sha256 digest computed on 2026-09-17. They are baked in
+rather than resolved by `spark-submit --packages`, so a cold start does not depend
+on Ivy resolution and 115 MB of Maven traffic.
+
+### Consequence
+
+This is the argument for digest pinning, made by the failure rather than by
+principle. The tag resolved, the manifest was valid, the layers unpacked, and the
+contents were not what the version number promised — a digest is the only part of
+an image reference that can detect that. The reproduction commands live in a comment
+at the top of `docker/spark.Dockerfile` so the next person to read that odd-looking
+`FROM` line gets the reason and can check whether it still holds.
+
+The cost is a manual step on every Spark upgrade: the digest has to be looked up
+and the six jar digests recomputed. That is the intended trade. An upgrade that
+silently pulls different bytes under the same tag is exactly the event this pin
+exists to make loud.
+
+---
+
+## ADR-0016 — `failOnDataLoss=false` on the bronze Kafka source
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+Kafka's retention on `wiki.recentchange` is 24 hours — `kafka_retention_ms` in
+`config.py`, applied by `scripts/create_topics.sh`. That is short on purpose:
+Kafka is a buffer in this design and bronze is the durable audit trail, so paying
+laptop disk to hold a second copy of history in the broker buys nothing.
+
+Spark's Kafka source defaults to
+`failOnDataLoss=true`: if the offsets the checkpoint recorded no longer exist on
+the broker, the query fails to start.
+
+On a laptop that combination fires for the most ordinary reason there is. Close
+the lid on Friday, open it on Monday, and the checkpoint points at offsets that
+expired on Saturday.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| Keep the default and fail loudly | Correct for a system where Kafka is the record of truth. Here it turns "I closed my laptop" into a manual checkpoint deletion, and a reviewer's second `make up` into a stack trace. |
+| Raise retention to 7 days | Moves the failure rather than removing it, and spends laptop disk on data that bronze already holds durably. |
+| Delete the checkpoint automatically on this error | Silently re-reads the whole topic and duplicates everything already in bronze. Worse than either alternative. |
+| `failOnDataLoss=false`, documented | Chosen. |
+
+### Decision
+
+Set it to false, and write down the cost where the flag is set rather than in a
+commit message: data that expired while the job was down is skipped rather than
+reported, and **nothing in the pipeline distinguishes that from a quiet period**.
+
+### Consequence
+
+Bronze's guarantee is precisely "everything Kafka still had when the job read it",
+not "everything Wikimedia ever sent", and `docs/data-contracts.md` states that
+under "what you may not rely on". A system where Kafka were the system of record
+would have to choose the other way, and the sentence explaining that is in the
+`bronze.py` module docstring so that anyone copying the flag out of this repo reads
+the condition attached to it.
+
+---
+
+## ADR-0017 — Bronze partitions by ingest date, silver by event date
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+Both tables hold the same events and both need a partition column. Using the same
+one in both places is the obvious choice and it is wrong in one of the two.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| Both by `days(event_date)` | A late event, or any replay of older data, writes into a bronze partition that was already written and compacted. The audit log stops being append-only in the physical sense even though it is append-only logically, and every backfill rewrites history. |
+| Both by `days(ingest_date)` | Makes every analytical question ("edits per hour on Tuesday") a full-table scan, because ingest time and event time only coincide while nothing has ever been replayed. |
+| Bronze by ingest date, silver by event date | Chosen. |
+
+### Decision
+
+`bronze.recentchange_raw PARTITIONED BY (days(ingest_date))`,
+`silver.edits PARTITIONED BY (days(event_date))`.
+
+### Consequence
+
+Ingest date is monotonic, so bronze's old partitions are immutable in practice and
+stay compacted: a replay of last week lands in today's partition and rewrites
+nothing. Event date is not monotonic, so silver pays a rewrite cost on late data —
+accepted, because it is the table analytics actually reads, and because Iceberg's
+row-level deletes make the rewrite a partition-local operation rather than a
+table-wide one.
+
+The visible consequence is that the two tables do not line up partition for
+partition, so a "compare bronze and silver for yesterday" query has to name which
+kind of yesterday it means. `late_by_seconds` in silver exists so that the
+difference is measurable rather than a matter of inference.
