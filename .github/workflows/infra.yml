@@ -1,0 +1,164 @@
+# Terraform and Kubernetes: validated on every change, applied never.
+#
+# `infra/aws/` and `k8s/` are design artefacts. Both READMEs open with a banner
+# saying so, and this workflow is what makes that claim checkable rather than
+# merely stated: it validates the module against the real provider schemas and the
+# manifests against the real Kubernetes schemas, and it has no way to reach a cloud
+# account while doing it. There is no credential, no `id-token` permission to mint
+# one with, and no `terraform plan` — `plan` reads live infrastructure, so it is not
+# a safe operation for a module that has never been applied. The `no-cloud-access`
+# job below asserts all of that mechanically, because a comment cannot.
+#
+# Path-filtered, because nothing here can be broken by the Python: a change to a
+# streaming job cannot invalidate a Terraform module. Workflow files are in the
+# filter so that editing this file re-runs its own guard.
+name: infra
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+      - "k8s/**"
+      - "scripts/validate_k8s.sh"
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - "infra/**"
+      - "k8s/**"
+      - "scripts/validate_k8s.sh"
+      - ".github/workflows/**"
+
+concurrency:
+  group: infra-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read the code. Nothing else. Stated here rather than left to the repository
+# default, which is read-write on accounts created before 2023.
+permissions:
+  contents: read
+
+env:
+  # The versions the local toolchain runs, so `make infra-validate` here and
+  # `make infra-validate` on a laptop are the same check. Dependabot bumps the
+  # `uses:` pins in this file but not these, because these are download URLs and it
+  # cannot see them — they move when the local toolchain moves.
+  TERRAFORM_VERSION: "1.16.3"
+  TRIVY_VERSION: "0.74.0"
+  KUSTOMIZE_VERSION: "5.8.1"
+  KUBECONFORM_VERSION: "0.8.0"
+
+jobs:
+  terraform:
+    name: terraform validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: hashicorp/setup-terraform@v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          # The wrapper replaces `terraform` with a shell script that captures
+          # stdout and stderr into step outputs. Nothing here reads those, and the
+          # substitution would mean `make infra-validate` was not running the
+          # binary a contributor runs.
+          terraform_wrapper: false
+
+      # fmt -check, init -backend=false, validate — the three commands, in the
+      # Makefile, so this job cannot drift from the documented one. `init` fetches
+      # provider schemas from registry.terraform.io, which needs the network but no
+      # account: `-backend=false` means no state is configured, and `validate` never
+      # calls an API.
+      - run: make infra-validate
+
+  trivy:
+    name: trivy config
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # The release tarball rather than the published action, for the same reason
+      # the step above turns the wrapper off: `make infra-scan` is the command in
+      # the README, and running it here is what keeps the README true. Installed
+      # under ~/.local/bin, which is where that target's error message tells a
+      # human to put it.
+      - name: install trivy ${{ env.TRIVY_VERSION }}
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin" trivy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Fails on any finding, not just on high severity. A module nobody applies
+      # has no operational pressure to accept a finding, so the bar can be the
+      # strict one — and a scanner whose findings are tolerated teaches a reader to
+      # tolerate them too.
+      - run: make infra-scan
+
+  kubernetes:
+    name: kubeconform
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: install kustomize ${{ env.KUSTOMIZE_VERSION }} and kubeconform ${{ env.KUBECONFORM_VERSION }}
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv${KUSTOMIZE_VERSION}/kustomize_v${KUSTOMIZE_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin" kustomize
+          curl -fsSL "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin" kubeconform
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # kubeconform fetches every schema it needs over HTTPS on a cold cache — the
+      # core ones from yannh/kubernetes-json-schema and the ArgoCD Application's
+      # from the CRD catalogue. Keyed on the manifests: adding a resource of a kind
+      # that has never been validated here misses the exact key, restores the rest
+      # from the prefix, and fetches only the one new schema.
+      - uses: actions/cache@v6.1.0
+        with:
+          path: .cache/kubeconform
+          key: kubeconform-${{ env.KUBECONFORM_VERSION }}-${{ hashFiles('k8s/**') }}
+          restore-keys: |
+            kubeconform-${{ env.KUBECONFORM_VERSION }}-
+
+      # Builds each overlay and validates the output with -strict, so an unknown
+      # field is an error rather than something the cluster would silently ignore.
+      # No cluster is contacted; scripts/validate_k8s.sh explains what that leaves
+      # unchecked.
+      - run: make k8s-validate
+
+  no-cloud-access:
+    name: assert no cloud access
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # Three ways this repository could stop being a zero-cost project, each
+      # checked here rather than trusted to review. The patterns skip comment
+      # lines, so the prose at the top of this file naming the things it does not
+      # do stays legible instead of tripping its own guard.
+      - name: no state file is tracked
+        run: |
+          if git ls-files | grep -E '\.tfstate'; then
+            echo "::error::a Terraform state file is tracked — this module is never applied" >&2
+            exit 1
+          fi
+
+      - name: no workflow plans or applies
+        run: |
+          if grep -rnE '^[^#]*terraform +(plan|apply)' .github/workflows; then
+            echo "::error::a workflow invokes an operation that reads or changes live infrastructure" >&2
+            exit 1
+          fi
+
+      - name: no workflow can authenticate to a cloud
+        run: |
+          if grep -rnE '^[^#]*(id-token *:|configure-aws-credentials|google-github-actions/auth|azure/login)' .github/workflows; then
+            echo "::error::a workflow requests a cloud identity; nothing in this project needs one" >&2
+            exit 1
+          fi
