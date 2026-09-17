@@ -1,0 +1,47 @@
+[sqlfluff]
+dialect = trino
+templater = jinja
+max_line_length = 100
+exclude_rules = structure.column_order, references.consistent
+
+[sqlfluff:indentation]
+indented_joins = false
+indented_ctes = false
+tab_space_size = 4
+
+[sqlfluff:layout:type:comma]
+line_position = trailing
+
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.identifiers]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.functions]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.literals]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.types]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:aliasing.table]
+aliasing = explicit
+
+[sqlfluff:rules:aliasing.column]
+aliasing = explicit
+
+# dbt's ref() and source() are resolved by dbt, not by sqlfluff. Rendering them
+# as bare strings lets sqlfluff parse the model without a dbt connection, which
+# keeps lint runnable in CI without bringing Trino up.
+[sqlfluff:templater:jinja:context]
+target = {"name": "ci", "schema": "gold"}
+
+[sqlfluff:templater:jinja:macros]
+ref = {% macro ref(model_name) %}silver.{{ model_name }}{% endmacro %}
+source = {% macro source(source_name, table_name) %}{{ source_name }}.{{ table_name }}{% endmacro %}
+config = {% macro config() %}{% endmacro %}
+is_incremental = {% macro is_incremental() %}false{% endmacro %}
+this = {% macro this() %}gold.this_model{% endmacro %}

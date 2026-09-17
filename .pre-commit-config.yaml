@@ -1,0 +1,73 @@
+# Runs the same checks CI runs, so a red pipeline is a surprise rather than a
+# routine. Install with `uv run pre-commit install`.
+#
+# Revisions are pinned exactly. `pre-commit autoupdate` is a deliberate act here,
+# not something a floating tag does behind your back.
+default_language_version:
+  python: python3.12
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        # Two trailing spaces are a hard line break in Markdown.
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+        # The multi-document separator is used in the Kubernetes manifests.
+        args: [--allow-multiple-documents]
+      - id: check-json
+      - id: check-toml
+      - id: check-added-large-files
+        # The demo recording is the only file that should come close. Anything
+        # bigger is a captured data dump that does not belong in git.
+        args: [--maxkb=4096]
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: detect-private-key
+      - id: check-executables-have-shebangs
+      - id: check-case-conflict
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.8
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/sqlfluff/sqlfluff
+    rev: 4.3.0
+    hooks:
+      - id: sqlfluff-lint
+        # dbt models are Jinja templates; linting them without a compiled target
+        # needs the templater configured in .sqlfluff, which is set to jinja.
+        files: ^(dbt/models|scripts)/.*\.sql$
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: system
+        # mypy needs the whole import graph; running it per-file gives false
+        # "module not found" errors, so pass no filenames.
+        pass_filenames: false
+        types_or: [python, pyi]
+
+      - id: no-instruction-files
+        name: no instruction files staged
+        # These are local build notes. Committing one would publish how the repo
+        # was scaffolded, and .gitignore alone does not protect against `git add -f`.
+        entry: >-
+          bash -c 'if git diff --cached --name-only | grep -qE
+          "^(CLAUDE|START_HERE|PROJECT_SPEC|BUILD_PHASES|ACCEPTANCE|WSL_SETUP|BUILD_LOG)\.md$";
+          then echo "Refusing to commit a local instruction file."; exit 1; fi'
+        language: system
+        pass_filenames: false
