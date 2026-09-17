@@ -206,6 +206,8 @@ documented in `CONTRIBUTING.md`.
 
 ## ADR-0005 — Derive the event schema from a capture, and declare it explicitly
 
+**Date:** 2026-09-17 · **Status:** accepted
+
 ### Context
 
 The pipeline needs a Spark schema for `recentchange` events. Two questions had to
@@ -249,6 +251,8 @@ backfill rather than lost.
 
 ## ADR-0006 — Keep the polymorphic `log_params` as raw JSON text
 
+**Date:** 2026-09-17 · **Status:** accepted
+
 ### Context
 
 `log_params` is not one shape. In the captured `log` events it is a JSON object
@@ -289,6 +293,8 @@ was a column that is null exactly when it is interesting.
 ---
 
 ## ADR-0007 — Parse permissively and quarantine explicitly
+
+**Date:** 2026-09-17 · **Status:** accepted
 
 ### Context
 
@@ -348,6 +354,8 @@ retention policy.
 
 ## ADR-0008 — Partition Kafka by wiki domain, accepting the skew
 
+**Date:** 2026-09-17 · **Status:** accepted, amended below the same day
+
 ### Context
 
 The topic needs a partitioning key. `meta.domain` (the wiki) is the natural
@@ -379,9 +387,36 @@ composite key (`domain` plus a bucket of `page_id`) which trades strict per-wiki
 ordering for per-page ordering — a better trade at volume, and an unnecessary
 complication here. Named in the README's limitations rather than pretended away.
 
+### Amendment, 2026-09-17: the 31.8% figure was the wrong quantity
+
+Once the topic existed and could be measured, the busiest partition held **58.3%**
+of a 5,000-record run (749 / 1,338 / 2,913 across three partitions), not the ~32%
+this entry implied. Both numbers are correct and they are not the same number:
+31.8% is the busiest *wiki's* share of traffic, which is only a lower bound on the
+busiest *partition*, because a partition receives every key that hashes to it.
+
+`make explain-partitions` reproduces the mechanism offline from the capture.
+librdkafka's default partitioner is `crc32(key) % partition_count`, and with three
+partitions `commons.wikimedia.org` (31.8%) and `id.wikipedia.org` (21.8%) collide
+on partition 2 — predicting 61.2% against the 58.3% measured hours later on a
+different sample. So this is two heavy keys landing together, not poor hash
+quality, and no partition count can go below 31.8% while one key is indivisible.
+
+Three partitions are kept regardless, which is a laptop-shaped decision rather
+than the general answer: Spark reads one Kafka partition per task and there are
+two executor cores, so six partitions would queue half the tasks and move the
+constraint rather than remove it. The full table of predicted skew per partition
+count, and the reason the real fix is a composite key rather than more partitions,
+is in `docs/throughput.md`.
+
+Corrected here rather than silently rewritten above, because the original estimate
+being off by 26 points is the more useful thing to record.
+
 ---
 
 ## ADR-0009 — A 10-minute watermark for a sub-second stream
+
+**Date:** 2026-09-17 · **Status:** accepted
 
 ### Context
 
@@ -413,3 +448,210 @@ this trade-off was cheap. An outage longer than ten minutes drops the oldest
 events on restart, and the README says so. On a stream two orders of magnitude
 larger the answer would flip to a tighter watermark plus a correction table for
 late arrivals.
+
+---
+
+## ADR-0010 — `confluent-kafka` as the Python client
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+The producer needs a Kafka client. The pipeline's whole argument is about
+duplicate suppression, so the client's idempotence support is not a detail — it
+decides which of the three duplicate sources can be closed at the producer and
+which have to be closed downstream.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| `kafka-python` | Pure Python, no build step, widely used. But it has no idempotent producer: no producer id, no per-partition sequence numbers, so an internal retry after a lost acknowledgement writes the record twice. That is exactly the duplicate class this repository claims to handle. |
+| `aiokafka` | Async, and it does implement idempotence. Rejected because the source is a blocking SSE iterator; adopting it would mean an event loop wrapped around synchronous I/O for no throughput gain at 51 events/s. |
+| `confluent-kafka` | Chosen. |
+
+### Decision
+
+`confluent-kafka` 2.15.x, the official librdkafka binding, with
+`enable.idempotence=true`.
+
+The cost is a compiled dependency — wheels exist for CPython on manylinux and
+macOS, so this is only felt on unusual platforms — and an API that is C-shaped
+rather than Pythonic: delivery is a callback, `poll()` must be called to serve
+those callbacks, and a full send queue raises `BufferError` rather than blocking.
+Each of those is a place to get it wrong quietly, so each has a test in
+`tests/unit/test_kafka_sink.py`, the load-bearing one being that a full queue makes
+`send` wait rather than drop.
+
+### Consequence
+
+Idempotence removes duplicates from producer-internal retries only, and that
+boundary is documented at the top of `kafka_sink.py` rather than left to be
+assumed. Restart duplicates (a new session gets a new producer id) and upstream
+replay duplicates (Wikimedia resumes SSE at or before `Last-Event-ID`) both remain,
+which is why bronze is append-only and silver MERGEs on `meta.id`. A client without
+idempotence would have made no difference to the pipeline's guarantees, only to how
+many duplicate classes it has to absorb — but "we chose the client that could not do
+it" is not a sentence worth writing.
+
+---
+
+## ADR-0011 — Advertise Kafka on two listeners, not one
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+Kafka clients bootstrap by connecting to any broker, receiving the cluster's
+*advertised* addresses, and then reconnecting to those. The address the client
+dialled is discarded. Containers on the compose network resolve `kafka`; pytest and
+`uv run` on the WSL host resolve `localhost:9092`. One advertised address cannot be
+correct for both.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| Advertise `kafka:29092` only | Containers work; every host-side test and script fails at the second connection with a DNS error, after an apparently successful bootstrap. The failure mode is confusing enough that it is worth engineering around rather than documenting. |
+| Advertise `localhost:9092` only | The reverse, and worse: inside a container `localhost` resolves to the container itself. |
+| Add `kafka` to the host's `/etc/hosts` | Works, needs root, and makes a fresh clone fail until a human edits a system file. Fails the "stranger runs one command" test. |
+| Two listeners | Chosen. |
+
+### Decision
+
+`INTERNAL://kafka:29092` and `HOST://localhost:9092`, with
+`KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL`. Only the host listener is published
+to the host. `WS_KAFKA_BOOTSTRAP_SERVERS` defaults to `localhost:9092` for the host
+context and is overridden per service in compose.
+
+### Consequence
+
+Every context reaches the broker with no host-file editing and no root. The cost is
+that "which port" now has two answers, so the Makefile keeps `KAFKA_INTERNAL` as a
+variable and a comment saying why, and a wrong bootstrap address produces a clear
+timeout rather than a resolvable-but-wrong connection. This is also the single
+detail most likely to break if the stack ever moves to Kubernetes, where the
+equivalent is a headless service plus per-pod advertised names — noted in `k8s/`
+rather than discovered later.
+
+---
+
+## ADR-0012 — Send Kafka the original frame, not a re-serialised one
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+The producer already parses each SSE frame, because it needs `meta.domain` for the
+partition key and it wants to count frames that fail to decode. Having a `dict` in
+hand, the obvious next step is to `json.dumps` it into the Kafka value.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| Re-serialise the parsed dict | Normalises key order and whitespace, which sounds tidy and is a quiet loss of fidelity: Python's JSON round-trip is not byte-identical to the source, it coerces some numeric forms, and it would silently repair malformed input that bronze is supposed to preserve as evidence. Bronze then stops being able to answer "what did Wikimedia actually send?" |
+| Parse in the producer, forward the parsed columns | Moves schema decisions into ingest, so a schema change requires a producer redeploy and old data cannot be reinterpreted. |
+| Forward the raw frame body | Chosen. |
+
+### Decision
+
+The Kafka value is the exact UTF-8 body the stream sent. The parse result is used
+only for the key and for counters, and a frame that fails to decode is still
+produced — unkeyed, so it round-robins — rather than dropped.
+
+### Consequence
+
+Bronze is a faithful byte-level record, which is what makes replaying it through a
+changed schema meaningful and what makes the quarantine table's stored payload
+worth storing. Parsing is deferred to Spark, where `from_json` on a declared schema
+handles it (ADR-0005, ADR-0007). Two costs, both accepted: the producer parses JSON
+it then throws away, which at this volume is free; and malformed frames reach the
+lakehouse, which is deliberate — a validation gate at ingest would mean the only
+copy of a bad record is a log line.
+
+---
+
+## ADR-0013 — `pyspark` is a dependency group, not a runtime dependency
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+`make test-spark` runs schema tests against a real in-process Spark, so pyspark
+must be installable from this project. The streaming jobs also import it. The
+default move is to put it in `[project] dependencies`.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| Runtime dependency | The producer image is the only image built from this repo and it never touches Spark. This would add roughly 400 MB of jars to a service whose job is to send JSON to Kafka, and would install a second pyspark alongside the one already in the Spark image — a driver/cluster version mismatch that surfaces as an opaque py4j traceback rather than a version error. |
+| Not a dependency at all; test Spark only in Docker | Makes the fastest correctness tests in the repo require the whole stack to be up, which is the wrong incentive. |
+| A `spark` dependency group | Chosen. |
+
+### Decision
+
+`spark = ["pyspark==4.0.4"]` under `[dependency-groups]`, pinned exactly rather
+than with a range, because it has to match the Spark image tag in
+`docker-compose.yml` for `make test-spark` to be testing the same engine that runs
+in production-shaped conditions.
+
+### Consequence
+
+The producer image stays small and Spark-free, and that is enforced rather than
+hoped for: `test_the_producer_imports_no_pyspark` starts a subprocess and imports
+the producer package with no pyspark available. That test exists because of a real
+failure — `wikistream.events` once imported the Spark schema module for a single
+tuple of field names, and the container died at start-up with `ModuleNotFoundError`.
+The cost is a second pin to keep in step with the image tag, and one place (the
+group definition) where that requirement is written down.
+
+---
+
+## ADR-0014 — zstd for topic compression, though gzip measured better
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+`recentchange` payloads are verbose JSON averaging 1,368 bytes with a small
+vocabulary of keys, so the codec choice is worth a measurement rather than a
+default. `make measure-compression` runs 2,000 frames through each codec into its
+own topic and reads what the broker has on disk.
+
+### Options considered
+
+Measured, not argued (ratio is payload bytes divided by bytes on disk, so it
+includes Kafka's record framing — which is why `none` comes out at 0.97x rather
+than 1.00x, understating every row by about 3% uniformly):
+
+| Codec | Ratio | Stored bytes/record |
+|---|---|---|
+| none | 0.97x | 1,401 |
+| **gzip** | **4.37x** | 312 |
+| zstd | 4.18x | 326 |
+| snappy | 3.25x | 426 |
+| lz4 | 3.19x | 422 |
+
+### Decision
+
+zstd, despite gzip winning the measurement by 4.5%.
+
+That margin is inside the run-to-run variance: zstd measured 4.18x here and 4.33x
+on the separate 5,000-frame run, on different samples of the same stream. The
+honest reading is that gzip and zstd are indistinguishable on ratio for this data
+and both are ~30% better than lz4 and snappy. What separates them is CPU per byte,
+and **this project did not measure CPU** — at 51 events/s the producer is idle
+waiting on the network, so neither codec is close to being the constraint. zstd is
+chosen for the property that survives a volume change: it has a tunable level, so
+the same codec spans "cheap" to "small" without a topic migration.
+
+### Consequence
+
+An earlier comment in `config.py` claimed zstd had the better ratio. It did not,
+and the measurement is what corrected the comment rather than the reverse; both the
+comment and `docs/throughput.md` now say gzip won on bytes and why zstd is still
+the default. The unmeasured half — codec CPU — is named as the most significant gap
+on that page instead of being papered over. At 50,000 events/s this decision should
+be reopened, and the reopening starts with the measurement that was skipped here.
