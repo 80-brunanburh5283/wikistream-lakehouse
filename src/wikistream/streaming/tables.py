@@ -140,13 +140,23 @@ CREATE TABLE IF NOT EXISTS {cfg.silver_edits_table} (
   is_bot           boolean,
   is_minor         boolean,
   is_anonymous     boolean   COMMENT 'editor is an IP or a MediaWiki temporary account',
-  bytes_old        int,
-  bytes_new        int,
-  bytes_delta      int       COMMENT 'bytes_new - bytes_old, null when either side is null',
+  -- bigint, not int, even though no wiki page approaches 2 GB. The parse schema
+  -- declares length.old/length.new as long, and narrowing a long to an int under
+  -- Spark 4's ANSI mode raises instead of returning null (ADR-0018) — so one absurd
+  -- value in one payload would fail the micro-batch, replay onto the same record and
+  -- halt ingestion, exactly the poison pill bronze avoids with try_to_timestamp.
+  -- Matching the source's width removes the cast, and with it the failure mode.
+  bytes_old        bigint,
+  bytes_new        bigint,
+  bytes_delta      bigint    COMMENT 'bytes_new - bytes_old; equals bytes_new on a page creation',
   rev_old          bigint,
   rev_new          bigint,
   comment          string,
-  late_by_seconds  int       COMMENT 'ingested_at - event_time, so lateness is queryable',
+  -- int is safe here where it was not above, because it is bounded by a validation
+  -- rule rather than by hope: `event_time_before_wikipedia` rejects any event_time
+  -- below 2001-01-15, so lateness cannot exceed now minus that date — 7.8e8 seconds
+  -- today, and inside int32 until 2069.
+  late_by_seconds  int       COMMENT 'ingested_at - event_time; negative means clock skew',
   ingested_at      timestamp,
   event_date       date      COMMENT 'partition column, derived from event_time'
 )
@@ -165,15 +175,26 @@ def silver_quarantine_ddl(settings: Settings | None = None) -> str:
 
     Partitioned by ingest date because the question asked of this table is always
     "what went wrong recently", never "what went wrong about events from March".
+
+    The Kafka coordinates are the key here, where `event_id` is the key in
+    `silver.edits`. They have to be: the commonest reason to land in this table is a
+    missing or unusable `event_id`, so keying on it would collapse every unrelated
+    malformed frame onto one row. `(kafka_partition, kafka_offset)` is the natural
+    key of a Kafka record and is always present, so the same MERGE that makes
+    `silver.edits` idempotent under batch retry works here too — which matters,
+    because a plain `append` inside `foreachBatch` carries no epoch tag and is
+    therefore *not* idempotent when Spark retries a micro-batch.
     """
     cfg = settings or get_settings()
     return f"""
 CREATE TABLE IF NOT EXISTS {cfg.silver_quarantine_table} (
   event_id        string    COMMENT 'nullable: the reason may be that there is no id',
   raw_payload     string    COMMENT 'the frame, so a fix can be replayed not just counted',
-  failure_reason  string    COMMENT 'which rule rejected it, from wikistream.events',
-  failed_at       timestamp,
-  ingest_date     date      COMMENT 'partition column'
+  failure_reason  string    COMMENT 'which rule rejected it, from wikistream.quality.expectations',
+  kafka_partition int       COMMENT 'with kafka_offset, the MERGE key for this table',
+  kafka_offset    bigint    COMMENT 'unique within a partition, and never null',
+  failed_at       timestamp COMMENT 'ingest time of the batch that rejected the row',
+  ingest_date     date      COMMENT 'partition column, derived from failed_at'
 )
 USING iceberg
 PARTITIONED BY (days(ingest_date))
