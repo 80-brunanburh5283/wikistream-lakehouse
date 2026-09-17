@@ -37,6 +37,11 @@ PYTEST_ARGS ?=
 # bash builtin holding the shell's own uptime, and a recipe reading it gets 0.
 LAG_SECONDS ?= 120
 
+# Extra arguments for `make maintain`, e.g. MAINTAIN_ARGS="--snapshot-age-hours 0" to
+# show expiry doing something without waiting a week for the age threshold to pass.
+# The figures in docs/lakehouse.md come from a run with exactly that argument.
+MAINTAIN_ARGS ?=
+
 .PHONY: help
 help: ## Show this help
 	@grep -hE '^[a-zA-Z0-9_.-]+:.*?## ' $(MAKEFILE_LIST) \
@@ -170,7 +175,7 @@ rebuild-silver: ## Rebuild silver from bronze for a date range: FROM=YYYY-MM-DD 
 
 .PHONY: maintain
 maintain: ## Compact files, expire snapshots, rewrite manifests, remove orphans
-	$(SPARK_SUBMIT) /opt/wikistream/scripts/maintain_tables.py
+	$(SPARK_SUBMIT) /opt/wikistream/scripts/maintain_tables.py $(MAINTAIN_ARGS)
 
 .PHONY: verify-no-duplicates
 verify-no-duplicates: ## Exit non-zero if silver.edits contains any duplicate event_id

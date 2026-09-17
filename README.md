@@ -14,10 +14,11 @@ tables on MinIO, dbt builds analytics marts over Trino, and Dagster models the
 whole thing as assets with checks.
 
 It exists to demonstrate the parts of data engineering that are hard to get
-right rather than hard to wire up: exactly-once delivery into a table format
-that has no primary keys, late-arriving events, restart safety under a hard
-kill, schema evolution, and the small-files problem that streaming into a
-lakehouse creates.
+right rather than hard to wire up: duplicate suppression in a table format that
+has no primary keys, late-arriving events, restart safety under a hard kill,
+schema evolution, and the small-files problem that streaming into a lakehouse
+creates. Each of those is checked by a command rather than asserted in prose —
+see [docs/correctness.md](docs/correctness.md).
 
 ## Quickstart
 

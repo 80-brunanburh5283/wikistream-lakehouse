@@ -108,7 +108,7 @@ class Settings(BaseSettings):
     # --------------------------------------------------------------- streaming
     checkpoint_root: str = Field(default="/opt/spark/checkpoints")
     #: Visible knob, not a default: 30s trades end-to-end latency for fewer,
-    #: larger Iceberg data files. See docs/correctness.md on small files.
+    #: larger Iceberg data files. See docs/lakehouse.md on small files.
     trigger_interval_seconds: int = Field(default=30, ge=1)
     #: There is deliberately no watermark setting. The silver stream declares no
     #: watermark at all — duplicate suppression is `MERGE INTO`'s job against the

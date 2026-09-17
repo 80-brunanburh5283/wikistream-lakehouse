@@ -95,7 +95,7 @@ def session_properties(settings: Settings | None = None) -> dict[str, str]:
         # A laptop has no shuffle to parallelise 200 ways. The default of 200
         # partitions on a micro-batch of a few thousand rows produces 200 tiny
         # files per commit, which is the small-files problem manufactured on
-        # purpose. See docs/correctness.md.
+        # purpose. See docs/lakehouse.md.
         "spark.sql.shuffle.partitions": "4",
         # Iceberg writes are already atomic through the catalog commit, and the
         # Hadoop committer's `_SUCCESS`/`_temporary` dance costs S3 round trips
