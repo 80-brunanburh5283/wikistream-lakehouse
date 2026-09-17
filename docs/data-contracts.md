@@ -6,16 +6,17 @@ which holds the DDL as SQL and is the only thing that creates a table. If the tw
 disagree, the DDL is right and this file is stale — the column lists here are meant
 to be checkable against it by eye.
 
-Status as of the bronze layer landing: `bronze.recentchange_raw` is written by
-`make stream-bronze` and has data. `silver.edits` and `silver.quarantine` are
-created empty by `make init-tables`; their columns are declared below because the
-declaration is what the bronze layer was designed against, but nothing writes to
-them yet.
+All three tables are written. `bronze.recentchange_raw` comes from
+`make stream-bronze`; `silver.edits` and `silver.quarantine` come from
+`make stream-silver`, which reads the same Kafka topic rather than reading bronze —
+see `src/wikistream/streaming/silver.py` for why, and "What you may not rely on"
+below for what that costs.
 
 ```bash
 make init-tables                                              # create all three
 make sql SQL="DESCRIBE TABLE lakehouse.bronze.recentchange_raw"
 make table-stats                                              # rows, files, partitions
+make verify-no-duplicates                                     # the uniqueness gate
 ```
 
 ## The layering rule
@@ -99,55 +100,121 @@ malformed frame as data is the reason the quarantine path in silver can ever fir
 
 ## `silver.edits`
 
-One row per source event, keyed on `event_id`. Declared now, written by the silver
-layer.
+One row per source event, keyed on `event_id`.
 
 | Column | Type | Notes |
 |---|---|---|
 | `event_id` | string, not null | Unique by `MERGE`, not by constraint — see below. |
-| `event_time` | timestamp, not null | The watermark column. |
+| `event_time` | timestamp, not null | From `meta.dt`, parsed with `try_to_timestamp`. |
 | `wiki`, `domain` | string | `enwiki`, `en.wikipedia.org`. `domain` is the Kafka partition key. |
 | `change_type` | string | `edit`, `new`, `log`, `categorize`. |
-| `namespace_id`, `is_article` | int, boolean | `is_article` is `namespace_id = 0`. |
+| `namespace_id`, `is_article` | int, boolean | `is_article` is `namespace_id = 0`, and is **null** when the namespace is unknown: "we do not know" and "not an article" are different answers. |
 | `page_title`, `page_url` | string | |
 | `editor`, `is_bot`, `is_minor`, `is_anonymous` | string, boolean × 3 | `is_anonymous` covers IP editors and MediaWiki temporary accounts. |
-| `bytes_old`, `bytes_new`, `bytes_delta` | int | `bytes_delta` is null when either side is null, which happens for log events. |
+| `bytes_old`, `bytes_new`, `bytes_delta` | bigint | `bytes_delta` is null when `bytes_new` is null, which happens for log events, and equals `bytes_new` when only `bytes_old` is null, which is a page creation. |
 | `rev_old`, `rev_new` | bigint | bigint, not int: the live values already exceed int32. |
 | `comment` | string | |
-| `late_by_seconds` | int | `ingested_at - event_time`, stored so lateness is queryable rather than recomputed. |
-| `ingested_at` | timestamp | |
+| `late_by_seconds` | bigint | `ingested_at - event_time`, stored so lateness is queryable rather than recomputed. Negative means the wiki's clock is ahead of ours. |
+| `ingested_at` | timestamp | Processing time, one value per micro-batch. On a rebuild it is bronze's stored value, not the replay's clock. |
 | `event_date` | date | The partition column, from `event_time`. |
 
 **Iceberg has no primary key and no uniqueness constraint.** Nothing in the table
-prevents a duplicate `event_id`; the only thing that will make the uniqueness claim
-true is that every write goes through `MERGE INTO ... WHEN MATCHED`. Until the
-silver layer exists, the claim is a design intention and this paragraph is the only
-thing supporting it. The invariant needs a test that fails when it is violated, and
-that test ships with the writer.
+prevents a duplicate `event_id`. The only thing that makes the uniqueness claim true
+is that every write goes through `MERGE INTO ... WHEN NOT MATCHED THEN INSERT`,
+which is why the writer has one code path and not two: both the stream and the
+rebuild call `merge_batch`.
 
-Today the same question can be asked of bronze, where the expected answer is the
-opposite:
+An invariant with no test is a wish, so there is a gate, and it exits non-zero:
 
 ```bash
-make table-stats   # prints distinct and repeated event_id per table
+make verify-no-duplicates    # duplicate event_id, null keys, duplicate quarantine offsets
+make table-stats             # prints distinct and repeated event_id per table
 ```
+
+`make table-stats` is the more interesting of the two, because it prints the same
+number for bronze, where the expected answer is the opposite: bronze is an audit log
+and a repeated `event_id` there is correct. Zero duplicates in silver only means
+something next to evidence that duplicates existed upstream.
+
+### What you may rely on
+
+* **`event_id` is unique.** Asserted three ways: on the statement text by
+  `test_the_merge_joins_only_on_the_declared_key`, against a real table by
+  `test_silver_holds_no_duplicate_event_id`, and against a table that has had a
+  duplicate forced into it by `test_the_gate_fails_when_a_duplicate_is_inserted` —
+  because a gate that has never failed is not known to work.
+* **Every bronze row reaches exactly one of the two silver tables.** The split is a
+  partition of the input, not two filters that happen to look complementary;
+  `test_every_frame_lands_in_exactly_one_table` asserts it on the frame level and
+  `test_the_two_tables_account_for_every_distinct_event` asserts the arithmetic on
+  landed tables.
+* **Which duplicate wins is deterministic.** The lowest `(kafka_partition,
+  kafka_offset)` — first arrival. Not "arbitrary but consistent": stable across a
+  replay of the same offsets, which is what makes a rebuild reproducible.
+  `test_the_earlier_offset_won_the_divergent_pair`.
+* **A rebuild reconstructs every column derived from the payload exactly.**
+  `test_a_rebuild_replaces_a_row_deleted_by_mistake` deletes a row, replays bronze,
+  and compares the restored row field by field rather than counting rows. The two
+  columns derived from *arrival* rather than from the payload are the exception, and
+  they are the next bullet down.
+
+### What you may not rely on
+
+* **Silver being a subset of bronze at any instant.** The two jobs read the same
+  topic independently and hold separate checkpoints, so either can be ahead. A set
+  difference between them is a race, not a defect, which is why the duplicate gate
+  deliberately does not check completeness.
+* **`late_by_seconds` being comparable across a rebuild.** It is `ingested_at -
+  event_time`, and the two writers get `ingested_at` from different places: the
+  stream stamps its own micro-batch clock, the rebuild reads what bronze stamped when
+  bronze consumed the same record. Since the jobs consume the topic independently,
+  a rebuilt row's lateness differs from the streamed row's by however far apart the
+  two batches ran — smaller, normally, because bronze usually gets there first.
+  `test_a_rebuilt_row_carries_bronzes_arrival_time_not_silvers` measures the shift
+  and asserts it is exactly the gap between the two arrival stamps. Taking bronze's
+  value is the deliberate choice: judging a replayed week-old event against today's
+  clock would report every row as a week late. A lateness histogram is therefore a
+  statement about the stream, not about the table.
+* **Late events being present.** They are, for any lateness — there is no watermark
+  and no `dropDuplicatesWithinWatermark`, deliberately, and
+  `tests/spark/test_watermark_would_drop_data.py` measures what the rejected design
+  would have discarded. The cost is that write amplification grows with table size
+  instead of staying flat; ADR-0019 states the trade and when it would be wrong.
+* **`is_bot` meaning "not a human".** It is the flag the wiki set, which bots set on
+  themselves. An unflagged bot is indistinguishable from a person here.
 
 ## `silver.quarantine`
 
-Rows that could not be made into a silver row, with the reason. Declared now,
-written by the silver layer.
+Rows that could not be made into a silver row, with the reason.
 
 | Column | Type | Notes |
 |---|---|---|
 | `event_id` | string | Nullable: the reason may be that there is no id. |
 | `raw_payload` | string | The frame, so a fix can be replayed rather than merely counted. |
-| `failure_reason` | string | Which rule rejected it. |
-| `failed_at` | timestamp | |
+| `failure_reason` | string | Which rule rejected it. One of seven values; `FAILURE_REASONS` in `quality/expectations.py` is the closed set, which is what makes a `GROUP BY` on this column finite. |
+| `kafka_partition`, `kafka_offset` | int, bigint | The MERGE key of this table, and the address to go and look at the record. |
+| `failed_at` | timestamp | The batch's `ingested_at`. |
 | `ingest_date` | date | Partition column. The question asked of this table is always "what went wrong recently". |
 
 A pipeline that drops bad rows silently is broken. A pipeline that dies on one bad
 row is also broken. This table is the third option, and it stores the payload so
 that a day's rejects can be repaired and replayed rather than only counted.
+
+**It keys on `(kafka_partition, kafka_offset)`, not on `event_id`,** because "the
+payload has no `meta.id`" is one of the reasons a row lands here. A MERGE on a null
+key matches nothing and would insert the row again on every retry — the one table in
+the pipeline whose job is to record broken data would be the one that duplicates.
+ADR-0021 has the alternatives.
+
+That key is a transport address rather than an event identity, and the consequence is
+worth stating: the same logical event replayed by the source arrives at two offsets
+and occupies two quarantine rows. For a log of what arrived that is the behaviour I
+want, but it means `count(*)` here answers "how many bad frames arrived", not "how
+many distinct events are broken".
+
+```bash
+make sql SQL="SELECT failure_reason, count(*) FROM lakehouse.silver.quarantine GROUP BY 1"
+```
 
 ## Types worth explaining
 
@@ -164,10 +231,31 @@ decodes with `errors="replace"`, so such a frame is stored with replacement
 characters instead of being rejected, and the JSON parse failure downstream is what
 sends it to quarantine.
 
-Four fields in the source payload overflow int32 and are declared `bigint`
-accordingly: `id`, `revision.old`, `revision.new`, `meta.offset`. Observed live
-values include `id = 3,468,178,745` and `meta.offset = 6,524,211,441`. Declaring
-those as `int` produces silent nulls under `from_json`, not an error.
+**Every integer that comes from the source or is computed from one is `bigint`.**
+Four fields in the payload already overflow int32 — observed values include
+`id = 3,468,178,745` and `meta.offset = 6,524,211,441`, both from the 500-event
+sample — so `id`, `revision.old`, `revision.new` and `meta.offset` have to be wide.
+`meta.dt`'s epoch-seconds twin is `bigint` for the ordinary reason that epoch seconds
+stop fitting in int32 in January 2038. Only `namespace` is narrow, and that is a
+genuine constraint rather than a gamble: MediaWiki namespace ids are a small closed
+set, measured range 0..106 with negatives for `Special:` and `Media:`.
+
+Declaring one of those as `int` does not truncate and does not null the column.
+Measured under PERMISSIVE mode on Spark 4.0.4: a value too wide for the declared type
+sets `_corrupt_record`, which this pipeline treats as an unreadable payload — so the
+**whole event** is quarantined, not just the offending field. Loud rather than silent,
+which is the better failure, but the loss is bigger than it looks: every edit on the
+largest wikis would land in `silver.quarantine` and nowhere else.
+
+`bytes_old`, `bytes_new`, `bytes_delta` and `late_by_seconds` are `bigint` for a
+different reason, and I got this one wrong first. The argument for `int` was that
+`event_time_before_wikipedia` bounds how far an event's clock can drift, so lateness
+is bounded too. It bounds drift in one direction only. A payload stamped 2099 gives
+`late_by_seconds = -2,281,290,900`, which overflows int32 — and the value is computed
+for every row *before* the rule that rejects that row gets to run, so under ANSI mode
+the narrowing cast raised, the micro-batch died, and it would have died again on
+every replay of the same offsets. A validation rule cannot protect a column computed
+upstream of it. `test_every_frame_lands_in_exactly_one_table` is what found it.
 
 ## Table properties
 

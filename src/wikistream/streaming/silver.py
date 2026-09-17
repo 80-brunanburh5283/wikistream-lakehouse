@@ -232,6 +232,13 @@ def frames_from_bronze(bronze_df: DataFrame) -> DataFrame:
     time would report every replayed row as a month late and would fail the
     future-tolerance rule differently than the live path did. The reference time
     belongs to the arrival, so it is read from the table.
+
+    It is bronze's arrival, though, not silver's. The two jobs consume the topic
+    independently, so a rebuilt row carries a slightly earlier `ingested_at` than the
+    streamed row it replaces, and a correspondingly smaller `late_by_seconds`. That is
+    the one way a rebuild does not reproduce a row exactly;
+    `test_a_rebuild_replaces_a_row_deleted_by_mistake` pins the difference to those two
+    columns and to that amount.
     """
     return bronze_df.select(*FRAME_COLUMNS)
 
