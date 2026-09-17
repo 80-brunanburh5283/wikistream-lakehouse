@@ -26,6 +26,25 @@ supposed to be uninterpreted. Each one earns it:
 All three are nullable, and a frame that yields null for all three is still
 appended. `raw_payload` remains the source of truth; these are an index over it.
 
+## ANSI mode makes a bad timestamp a poison pill
+
+Spark 4.0 enables `spark.sql.ansi.enabled` by default, which changes what a
+malformed cast does. Measured in this container on 2026-09-17:
+
+    SELECT to_timestamp(s)      FROM VALUES ('2026-09-17T10:00:00Z'), ('nonsense')
+    -> [CAST_INVALID_INPUT] SparkDateTimeException, raised inside the generated
+       iterator, so it is a per-row failure and not just constant folding
+
+    SELECT try_to_timestamp(s)  FROM the same rows
+    -> one timestamp, one null
+
+An exception here is worse than a wrong value. The micro-batch fails, the
+checkpoint has not advanced, the restart reads the same offsets, and the job dies
+on the same record indefinitely — ingestion stops for the whole topic because one
+frame had a bad `meta.dt`. So bronze uses `try_to_timestamp` and lets the null
+travel: the row still lands with its payload intact, and silver's quarantine step
+is what reports it. `tests/spark/test_bronze_mapping.py` holds this down.
+
 ## Offsets, and the one flag that looks reckless
 
 `startingOffsets=earliest` applies only on the very first run of a checkpoint.
@@ -138,7 +157,12 @@ def to_bronze_rows(kafka_df: DataFrame) -> DataFrame:
         # below yields null rather than raising. That is the intended behaviour:
         # bronze appends it, and silver's quarantine step is what notices.
         .withColumn("event_id", F.col("_parsed.meta.id"))
-        .withColumn("event_time", F.to_timestamp(F.col("_parsed.meta.dt")))
+        # `try_to_timestamp`, not `to_timestamp`. Spark 4.0 enables ANSI mode by
+        # default, and under ANSI a malformed timestamp string is an exception, not
+        # a null — see the module docstring for the measurement. In a streaming job
+        # that exception is a poison pill: the batch fails, the checkpoint replays
+        # the same offsets, and the job dies again on the same record forever.
+        .withColumn("event_time", F.try_to_timestamp(F.col("_parsed.meta.dt")))
         # Backticks because the field is literally named `$schema` and `$` starts
         # nothing in Spark SQL's identifier grammar.
         .withColumn("schema_uri", F.col("_parsed.`$schema`"))

@@ -157,11 +157,20 @@ build.
 
 ### Consequence
 
-`docker/spark/Dockerfile` pins four jar URLs by full coordinate. Upgrading Spark
+`docker/spark.Dockerfile` pins each jar URL by full coordinate. Upgrading Spark
 means changing the image tag, the PySpark pin, the connector jar and possibly the
 Iceberg runtime together — which is why `dependabot.yml` ignores major-version
 bumps on `apache/spark` and `apache/iceberg-rest-fixture`. That is deliberate:
 those are compatibility-matrix exercises, not version bumps.
+
+**Amended in Phase 4.** Two details above are out of date and the reason is worth
+keeping rather than editing away. The Spark *version* held, but the publisher did
+not: `apache/spark:4.0.4-scala2.13-java17-python3-ubuntu` turned out to ship 41
+zero-byte jars, so the image is now the Docker Official Images build pinned by
+digest — ADR-0015. And the jar count grew from four to six once
+`spark-token-provider-kafka-0-10` and `commons-pool2` proved to be transitive
+dependencies that `--packages` would have resolved silently; the Maven traffic
+figure measured 115 MB rather than 105 MB.
 
 ---
 
@@ -812,3 +821,56 @@ The visible consequence is that the two tables do not line up partition for
 partition, so a "compare bronze and silver for yesterday" query has to name which
 kind of yesterday it means. `late_by_seconds` in silver exists so that the
 difference is measurable rather than a matter of inference.
+
+---
+
+## ADR-0018 — Keep ANSI mode on and parse with `try_*`, rather than disabling it
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+Spark 4.0 enables `spark.sql.ansi.enabled` by default. Under ANSI, a malformed
+cast raises instead of returning null. Measured in this project's container,
+2026-09-17:
+
+```sql
+SELECT to_timestamp(s)     FROM VALUES ('2026-09-17T10:00:00Z'), ('nonsense');
+-- [CAST_INVALID_INPUT] SparkDateTimeException, raised from inside
+-- GeneratedIteratorForCodegenStage1 — a per-row failure, not constant folding
+SELECT try_to_timestamp(s) FROM VALUES ('2026-09-17T10:00:00Z'), ('nonsense');
+-- one timestamp, one null
+```
+
+Bronze was written with `to_timestamp(meta.dt)`. That is a poison pill in a
+streaming job: the micro-batch fails, the checkpoint does not advance, the retry
+reads the same offsets, and the job dies on the same record forever. One malformed
+`meta.dt` would stop ingestion for the whole topic — and because Spark retries
+before failing the query, it would do so after a delay, which is the worst kind of
+outage to diagnose.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| `spark.sql.ansi.enabled=false` in `session_properties` | Fixes every cast in the project with one line, and throws away the thing ANSI is for. Silent nulls from a bad cast are how a column empties without anything going red — the exact failure mode `docs/data-contracts.md` names as the one that breaks schema evolution. Also makes this project's SQL behave differently from the Trino and dbt layers, which do not have a mode to turn off. |
+| Keep ANSI on, use `to_timestamp`, catch the failure per batch | There is nothing useful to do with the exception. It names neither the offset nor the payload, so the handler could only skip the whole batch. |
+| Keep ANSI on, parse with `try_to_timestamp`, quarantine the nulls | Chosen. |
+
+### Decision
+
+ANSI mode stays at Spark's default of enabled. Every cast that touches source data
+uses the `try_*` form, and a null result is a validation failure that
+`silver.quarantine` records with a reason — the same treatment as a missing field.
+
+### Consequence
+
+Bad data becomes a row in a table instead of an exception in a log, which is the
+behaviour the whole quarantine design already assumed. The cost is that `try_*`
+must be remembered at every such call site; it is not the default, and a reviewer
+adding a `to_timestamp` later would reintroduce the poison pill.
+
+Two things guard against that: `tests/spark/test_bronze_mapping.py` asserts the
+malformed case yields null rather than raising, and it first asserts that ANSI mode
+is actually on, so the guard cannot quietly stop testing anything if a future Spark
+changes the default back.
