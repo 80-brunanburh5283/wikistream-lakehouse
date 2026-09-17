@@ -1,0 +1,61 @@
+# Local build instructions — not part of the published project
+/CLAUDE.md
+/START_HERE.md
+/PROJECT_SPEC.md
+/BUILD_PHASES.md
+/ACCEPTANCE.md
+/WSL_SETUP.md
+/BUILD_LOG.md
+
+# Secrets and local configuration
+.env
+.env.local
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Spark / Iceberg local state
+spark-warehouse/
+checkpoints/
+derby.log
+metastore_db/
+data/
+
+# dbt
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+dbt/.user.yml
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Scratch
+docs/img/*.tmp
+/tmp/
+*.log
+!dbt/logs/.gitkeep

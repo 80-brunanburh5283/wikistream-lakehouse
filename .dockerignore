@@ -1,0 +1,36 @@
+# Keep the build context small: the images only need src/, scripts/, dbt/ and
+# dagster/. Sending .venv or .git makes every rebuild slow for no benefit.
+.git
+.github
+.venv
+venv
+.mypy_cache
+.ruff_cache
+.pytest_cache
+__pycache__
+*.py[cod]
+.coverage
+htmlcov
+coverage.xml
+
+.env
+.env.local
+
+# Local build instructions — must never enter an image layer either
+CLAUDE.md
+START_HERE.md
+PROJECT_SPEC.md
+BUILD_PHASES.md
+ACCEPTANCE.md
+WSL_SETUP.md
+BUILD_LOG.md
+
+docs/img
+data
+checkpoints
+spark-warehouse
+dbt/target
+dbt/dbt_packages
+dbt/logs
+infra
+k8s
