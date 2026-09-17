@@ -874,3 +874,318 @@ Two things guard against that: `tests/spark/test_bronze_mapping.py` asserts the
 malformed case yields null rather than raising, and it first asserts that ANSI mode
 is actually on, so the guard cannot quietly stop testing anything if a future Spark
 changes the default back.
+
+---
+
+## ADR-0019 — No watermark on the silver stream
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+The design this project was written to called for `withWatermark("event_time", "10
+minutes")` and `dropDuplicatesWithinWatermark` on the silver stream. That is the
+textbook answer for streaming deduplication: it bounds the state store, so the job's
+memory does not grow with uptime.
+
+Wikimedia's `recentchange` stream does not behave the way that design assumes. A
+wiki that loses its connection to the event bus reconnects and replays, and the
+replay can be tens of minutes behind. Measured source lag has a p99 of 4m12s
+(`docs/latency.md`), but the tail is not bounded by anything I control.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| `withWatermark` + `dropDuplicatesWithinWatermark("event_id")` | Measured, not assumed: `tests/spark/test_watermark_would_drop_data.py` feeds a unique event 30 minutes behind the watermark through this exact operator and the row is **gone**. No exception, no `_corrupt_record`, no quarantine row, no metric — `numOutputRows` is simply one lower than `numInputRows`. A reconnecting wiki would lose edits and nothing in the pipeline would say so. |
+| `withWatermark` with no stateful operator | Satisfies the specification and changes no output at all — the same test proves it drops nothing, because a watermark is only a filter in combination with an operator that reads it. Declaring one to tick a box would be decoration, and the README would be claiming a guarantee that no code provides. |
+| `withWatermark` with a threshold wide enough to be safe | Any threshold is a cliff somewhere. The same test shows 5 minutes late survives a 10-minute threshold and 30 does not; picking 24 hours to be safe keeps 24 hours of keys in state, which is the cost the watermark existed to avoid. |
+| No watermark; deduplicate with `MERGE INTO` against the table | Chosen. |
+
+### Decision
+
+The silver stream declares no watermark. Duplicate suppression is the table's job:
+`MERGE INTO ... WHEN NOT MATCHED THEN INSERT` looks the key up in `silver.edits`
+itself, so the deduplication window is the table's whole history rather than a
+tunable number of minutes. Within a micro-batch, `row_number()` collapses duplicates
+before the MERGE, because a MERGE whose source has two rows matching one target row
+raises rather than picking one.
+
+### Consequence
+
+An event arriving arbitrarily late is still deduplicated correctly, and lateness is
+recorded rather than discarded — `late_by_seconds` is a column, so "how late does
+this source actually get" is a query and not a guess.
+
+The cost is real and belongs in the README's limitations rather than in a footnote:
+the MERGE reads the target table on every micro-batch, so write cost grows with
+table size instead of staying flat, and Iceberg's partition pruning is the only thing
+keeping that sublinear. A stream that has to keep up with a firehose would need the
+watermark back, plus a Bloom filter or a bounded lookback predicate on the MERGE.
+This pipeline handles roughly 30 events a second, where the trade lands the other way.
+
+The objection to the rejected design is not that watermarks discard data
+indiscriminately. It is that ten minutes is a hard cliff with no diagnostic on the
+far side of it, and I would rather pay for correctness in write amplification, where
+it is measurable, than in silent loss.
+
+---
+
+## ADR-0020 — `MERGE INTO` inside `foreachBatch`, not the Iceberg streaming sink
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+Iceberg's Spark streaming sink is idempotent on its own: it records the
+`spark.sql.streaming.epochId` of each committed batch and refuses to apply the same
+epoch twice, so an at-least-once retry from Structured Streaming does not duplicate
+rows. Writing silver with `writeStream.format("iceberg")` would get that for free.
+
+Silver needs to write two tables from one batch — `edits` and `quarantine` — and it
+needs an upsert rather than an append, neither of which the streaming sink does.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| Two `writeStream` queries, one per table, both using the Iceberg sink | Two queries means two checkpoints reading the same topic, so the split between valid and invalid rows would be computed twice and could disagree across a code change. It also doubles the Kafka consumers for one logical job. |
+| One `foreachBatch`, `writeTo(...).append()` for each table | This is the trap. The epoch-id idempotency belongs to the Iceberg *sink*; a batch write issued inside `foreachBatch` carries no epoch tag, so a retried batch appends its rows a second time. The result is a pipeline that looks exactly like the correct one and duplicates on every failure. |
+| One `foreachBatch`, `MERGE INTO ... WHEN NOT MATCHED` for each table | Chosen. |
+
+### Decision
+
+`foreachBatch` writes both tables with a generated `MERGE INTO`, joining on that
+table's declared key. `WHEN NOT MATCHED THEN INSERT` and no `WHEN MATCHED` clause at
+all: the merge inserts what is new and leaves what exists untouched, which is
+idempotent by construction rather than by bookkeeping. A replayed batch re-executes
+the same MERGE and inserts nothing.
+
+### Consequence
+
+Retries are safe without relying on a sink feature the code is not using, and the
+same function serves the stream and the rebuild — `rebuild_from_bronze` calls
+`merge_batch` with `batch_id=-1`, so the replay path cannot drift from the live path.
+
+It is also testable in a way epoch bookkeeping is not:
+`test_replaying_the_same_window_twice_changes_nothing` runs the whole window through
+the MERGE twice more and asserts every row count is unchanged, and
+`test_a_rebuild_replaces_a_row_deleted_by_mistake` deletes a row, replays, and
+compares the restored row column by column.
+
+The cost is the target-table read on every batch, which is the same cost ADR-0019
+accepts, and one sharp edge worth naming: `MERGE` raises when the source contains two
+rows matching one target row, so the intra-batch `row_number()` dedup is not an
+optimisation. Remove it and the first duplicated `event_id` in a batch fails the write.
+
+---
+
+## ADR-0021 — `silver.quarantine` keys on the Kafka coordinates, not on `event_id`
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+Both silver tables are written with a MERGE, so both need a key that identifies a
+row. `silver.edits` keys on `event_id`. The obvious move is to do the same for
+quarantine.
+
+It cannot: "the payload has no `meta.id`" is one of the six reasons a row lands in
+quarantine. A MERGE on a null key matches nothing, so every retry of that batch would
+insert the row again — the table whose purpose is to record broken data would be the
+one place in the pipeline that duplicates.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| Key on `event_id` | Null for the `event_id_missing` reason, which is the most common shape of upstream breakage. Idempotency would hold for every quarantine reason except the one that matters most. |
+| Key on a hash of `raw_payload` | Stable and never null, but wrong: two genuinely distinct events with identical payloads would collapse into one quarantine row, and the point of the table is to hold every rejected frame for replay. It also makes the key unreadable — you cannot go and look at offset `sha256:…`. |
+| Key on `(kafka_partition, kafka_offset)` | Chosen. |
+
+### Decision
+
+`QUARANTINE_KEY = ("kafka_partition", "kafka_offset")`, and both columns are in the
+table. Kafka guarantees the pair is unique within a topic, it is never null for a row
+that arrived, and it is the address an operator uses to go and look at the record.
+
+### Consequence
+
+The quarantine table is idempotent under retry for every failure reason including a
+missing id, which `test_quarantined_rows_carry_their_kafka_coordinates` and the
+duplicate gate both assert. `raw_payload` is stored next to the coordinates so a
+day's rejects can be fixed and replayed rather than only counted.
+
+One consequence to be honest about: the key is a *transport* address, not an event
+identity. The same logical event replayed by the source lands at two offsets and
+would occupy two quarantine rows. For an error table that is the behaviour I want —
+it is a log of what arrived, not a set of distinct problems — but it means
+`count(*)` on quarantine answers "how many bad frames arrived", not "how many
+distinct events are broken", and a dashboard should group by `failure_reason` rather
+than trusting the total.
+
+---
+
+## ADR-0022 — The parse verdict is Spark's alone; only the rules have a Python twin
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+`wikistream.quality.expectations` deliberately expresses every validation rule twice,
+once as a Python predicate and once as Spark SQL, and
+`tests/spark/test_expectation_parity.py` runs both over all 519 fixture frames and
+fails on any disagreement. That is what makes the duplication safe.
+
+The natural next step is to extend the same treatment to "is this payload readable at
+all" — a `json.loads` twin for `from_json`. I tried, and it does not hold.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| A Python `_parse_failed` twin using `json.loads` | Measured on Spark 4.0.4: the two disagree on 9 of 21 payload shapes. `from_json` in PERMISSIVE mode accepts trailing content, accepts a bare scalar, and returns a struct of nulls with `_corrupt_record` set rather than raising; a blank payload gives a null struct *and* a null `_corrupt_record`, so the check has to be `_parsed IS NULL OR _corrupt_record IS NOT NULL`. A twin would encode Spark's parser quirks in Python and the parity test would pass by copying the bug. |
+| Make the SQL side stricter so the twin can be simple | Means rejecting frames Spark can in fact read. Data loss to make a test tidy. |
+| Split the responsibility: Spark decides readability, the rules decide usability | Chosen. |
+
+### Decision
+
+There is one reason code, `payload_not_json`, that has no Python counterpart and is
+produced only by inspecting `from_json`'s output. Every other reason — six rules
+about presence, parseability and range — exists in both languages and is parity
+tested. `RULE_INPUT_COLUMNS` is the interface between the two halves, and
+`to_candidates` raises if the projection stops producing a column some rule reads.
+
+### Consequence
+
+The parity test keeps its value, because it now covers exactly the rules where two
+implementations can be compared and nothing else. The parser's behaviour is pinned by
+a table of measured payload shapes in `quality/expectations.py` rather than by a
+second implementation — a comment that cites measurements, next to a test that
+asserts the current verdicts.
+
+The gap this leaves is honest and worth stating: if a future Spark changes what
+PERMISSIVE mode accepts, the parity test will not notice, and the symptom would be
+frames moving between `silver.edits` and `silver.quarantine` after a version bump.
+The measured-shapes test is what would catch it, so it asserts the verdict for each
+shape rather than merely that parsing "works".
+
+---
+
+## ADR-0023 — Target the Spark image's Python 3.10, not the dev environment's 3.12
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+`uv` builds this project's environment on Python 3.12, the producer image is
+`python:3.12.14-slim`, and both were chosen. The Spark image's interpreter was not: it
+comes with the Docker Official image and it is **Python 3.10.12**.
+
+`spark-submit` runs the streaming jobs with that interpreter, against the source tree
+bind-mounted into the container. So a 3.11+ idiom anywhere in shared code passes every
+local test on 3.12 and then fails at import time inside the container.
+
+It did. `wikistream.quality.expectations` used `from datetime import UTC`, added in
+Python 3.11. 285 unit and Spark tests were green, and the silver job died on its first
+run in the container with `ImportError: cannot import name 'UTC'`. The first
+integration test to run the job under `spark-submit` is what found it.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| Install Python 3.12 into the Spark image | The bundled pyspark lives under `$SPARK_HOME/python` and the image's entrypoints resolve `python3` from PATH. Pointing `PYSPARK_PYTHON` at a second interpreter means re-installing every dependency into it and taking on a driver/worker mismatch that surfaces as a py4j traceback. A large change to the one part of the stack that currently works, to avoid writing `timezone.utc`. |
+| Keep 3.12 as the target and rely on integration tests to catch drift | They do catch it — this ADR exists because one did — but only after a full stack is up, which is the slowest and least frequently run tier. A five-character mistake should not need Docker to find. |
+| Fence off a "container-safe" subset of `src/` with its own target | Two Python dialects in one source tree, with the boundary maintained by memory. `config`, `logging` and `events` are imported by both runtimes; the boundary would move with every refactor. |
+| Target 3.10 for all first-party Python | Chosen. |
+
+### Decision
+
+Ruff's `target-version` and mypy's `python_version` are both `py310`/`3.10`, matching
+the Spark image. The dev environment stays on 3.12 — `requires-python` is unchanged,
+because that governs what the tooling runs on, not what the code may use.
+
+### Consequence
+
+The failure is now caught by `make lint`, with no containers involved: typeshed gates
+`datetime.UTC` behind `sys.version_info >= (3, 11)`, so mypy rejects it, and ruff at
+`py310` stops *suggesting* it — UP017 rewrites `timezone.utc` into `datetime.UTC` at
+py311+, which would have reintroduced the bug on the next `ruff --fix`. That detail is
+the reason both settings had to move rather than just one.
+
+The cost is a slightly older dialect in code that runs on a newer interpreter, which
+is a fair price for the constraint being checked rather than remembered. `vermin
+--target=3.10-` was used to survey the tree and found `datetime.UTC` to be the only
+violation; it is not a permanent dependency, because ruff and mypy now cover the same
+ground on every commit.
+
+## ADR-0024 — Orphan cleanup lists storage through Iceberg's FileIO, not Hadoop's
+
+**Date:** 2026-09-17 · **Status:** accepted
+
+### Context
+
+Three of the four Iceberg maintenance procedures read the table's metadata to decide
+what to do. `remove_orphan_files` cannot: an orphan is by definition a file the metadata
+does not mention, so the procedure has to list the object store directly and diff the
+listing against the manifests.
+
+It does that through Hadoop's `FileSystem` API by default, and this catalog's tables
+live at `s3://lakehouse/warehouse/…`. Hadoop has no filesystem registered for the `s3`
+scheme — its S3 connector is `s3a` — because `streaming.session` routes storage through
+Iceberg's own `S3FileIO` instead, one filesystem layer fewer and the path Iceberg tests.
+The result, measured against Iceberg 1.10.1 on the live catalog:
+
+```
+UnsupportedFileSystemException: No FileSystem for scheme "s3"
+  at FileSystemWalker.listDirRecursivelyWithHadoop(FileSystemWalker.java:122)
+  at DeleteOrphanFilesSparkAction.listedFileDS(DeleteOrphanFilesSparkAction.java:329)
+```
+
+The first three procedures had already succeeded in the same run, which is what makes
+this worth an ADR: "Iceberg works against MinIO" and "every Iceberg procedure works
+against MinIO" are different claims, and only the first was true.
+
+### Options considered
+
+| Option | Why not |
+|---|---|
+| Add `hadoop-aws` plus the AWS SDK to the Spark image and configure `fs.s3.impl` | Two S3 clients in one JVM, each with its own credentials, endpoint and path-style settings, to serve one procedure. `hadoop-aws` on Hadoop 3.4 pulls the AWS SDK v2 bundle — several hundred MiB on an image that has to be pullable on a laptop — and the shaded SDK already inside `iceberg-aws-bundle` cannot be shared with it. |
+| Rewrite the table locations as `s3a://` | Changes the warehouse URI the REST catalog hands out, so every existing table's metadata points at the old scheme. Migrating paths to work around a listing implementation is the tail wagging the dog. |
+| Build the file listing in Python and pass it as `file_list_view` | The procedure does accept a pre-computed view of `(file_path, last_modified)`, which would work. It also means writing and testing an S3 lister — pagination, clock handling, a `boto3` dependency in the Spark image — to reproduce something Iceberg already has. |
+| Drop the procedure and document the gap | Tempting, and it would have been honest. But it leaves the pipeline with no answer for the files its own restart-idempotency proof strands, and the fix turned out to be one argument. |
+| `prefix_listing => true` | Chosen. |
+
+### Decision
+
+`remove_orphan_files_sql` always passes `prefix_listing => true`, which switches the
+walk to `listDirRecursivelyWithFileIO` and lists through the table's own FileIO. The
+argument is not conditional: this repository configures the catalog in exactly one
+place, `S3FileIO` supports prefix operations, and a flag that is sometimes set is a flag
+whose failure mode has to be discovered twice.
+
+Finding the argument needed reading the procedure's bytecode
+(`javap -c` on `RemoveOrphanFilesProcedure`, whose string constants are its parameter
+names), because Spark reports an unknown named argument as the procedure not existing.
+That is recorded here because it is the reproducible way to answer "what arguments does
+this procedure take" for any Iceberg version.
+
+### Consequence
+
+`make maintain` runs all four procedures and exits 0, and
+`tests/integration/test_silver_rebuild.py::test_maintenance_preserves_every_row` is what
+proves it — the argument names cannot be checked any other way.
+`tests/unit/test_maintenance.py::test_orphan_listing_goes_through_the_table_io_not_hadoop`
+pins the flag itself, because nothing in the statement suggests it is load-bearing and
+the failure only appears against real storage.
+
+The trade this accepts: on a warehouse using `HadoopFileIO` — a local `file://` path,
+or HDFS — `prefix_listing => true` is the argument that would break, since it requires a
+FileIO implementing `SupportsPrefixOperations`. The assumption is tied to the catalog
+configuration, and both live in the two modules that a reader of either would open.
+
+Iceberg's own 24-hour floor on `older_than` stays in place, so the procedure cannot be
+demonstrated deleting a file in a test that runs in seconds: the orphans it would remove
+have to be a day old. The integration test therefore asserts that the call succeeds and
+removes nothing, which is the assertion that would have caught this failure.
