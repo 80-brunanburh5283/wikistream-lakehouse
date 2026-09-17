@@ -15,9 +15,22 @@ PROJECT       ?= wikistream
 SPARK_SUBMIT  := $(COMPOSE) exec -T spark /opt/spark/bin/spark-submit
 DBT           := $(COMPOSE) run --rm dbt
 
+# Every profile, for the targets that must not miss a container: down, clean, ps.
+ALL_PROFILES  := --profile full --profile producer
+
+# Containers reach the broker on the in-network listener. localhost:9092 is the
+# host listener and is not resolvable from inside the compose network.
+KAFKA_INTERNAL := kafka:29092
+KAFKA_BIN      := /opt/kafka/bin
+TOPIC          := $${WS_KAFKA_TOPIC:-wiki.recentchange}
+
 # Bounded run length for the CI-friendly producer target.
 PRODUCER_SECONDS ?= 60
 PRODUCER_EVENTS  ?= 2000
+
+# Sampling window for the source-lag measurement. Not named SECONDS: that is a
+# bash builtin holding the shell's own uptime, and a recipe reading it gets 0.
+LAG_SECONDS ?= 120
 
 .PHONY: help
 help: ## Show this help
@@ -30,25 +43,25 @@ help: ## Show this help
 .PHONY: up
 up: ## Bring up the whole stack (full profile: + Trino, Dagster)
 	$(COMPOSE) --profile full up -d --wait
-	@$(MAKE) --no-print-directory init-tables
+	@$(MAKE) --no-print-directory create-topics
 
 .PHONY: up-core
-up-core: ## Bring up the low-memory profile (Kafka, MinIO, Iceberg REST, Spark, producer)
-	$(COMPOSE) --profile core up -d --wait
-	@$(MAKE) --no-print-directory init-tables
+up-core: ## Bring up the always-on core only (Kafka, MinIO, Iceberg REST)
+	$(COMPOSE) up -d --wait
+	@$(MAKE) --no-print-directory create-topics
 
 .PHONY: down
 down: ## Stop everything. Preserves volumes, so offsets and tables survive.
-	$(COMPOSE) --profile full --profile core down --remove-orphans
+	$(COMPOSE) $(ALL_PROFILES) down --remove-orphans
 
 .PHONY: clean
 clean: ## Stop everything and delete volumes. Destroys all local data.
-	$(COMPOSE) --profile full --profile core down --remove-orphans --volumes
+	$(COMPOSE) $(ALL_PROFILES) down --remove-orphans --volumes
 	@echo "Volumes removed. The next 'make up' starts from an empty lakehouse."
 
 .PHONY: ps
 ps: ## Show service status and health
-	$(COMPOSE) --profile full --profile core ps
+	$(COMPOSE) $(ALL_PROFILES) ps
 
 .PHONY: logs
 logs: ## Tail logs for all running services (SERVICE=name to narrow)
@@ -60,24 +73,69 @@ bootstrap: ## Check this machine can run the stack, before you try
 
 # ------------------------------------------------------------------- ingest
 
+.PHONY: build
+build: ## Build the producer image
+	$(COMPOSE) build producer
+
+.PHONY: create-topics
+create-topics: ## Create or reconcile the ingest topic (idempotent)
+	@bash scripts/create_topics.sh
+
+.PHONY: ingest
+ingest: ## Start the producer as a background service that restarts on failure
+	$(COMPOSE) up -d producer
+	@echo "Ingesting. Follow it with: make logs SERVICE=producer"
+
 .PHONY: producer
 producer: ## Run the producer in the foreground, unbounded (Ctrl-C to stop)
-	$(COMPOSE) --profile core run --rm producer
+	$(COMPOSE) run --rm producer
 
 .PHONY: producer-bounded
 producer-bounded: ## Run the producer for PRODUCER_SECONDS or PRODUCER_EVENTS, whichever first
-	$(COMPOSE) --profile core run --rm producer \
+	@# The long-lived service is stopped first so the offsets this run adds are
+	@# attributable to this run. Harmless when it was never started.
+	@$(COMPOSE) stop producer >/dev/null 2>&1 || true
+	$(COMPOSE) run --rm producer \
 	  python -m wikistream.producer --duration $(PRODUCER_SECONDS) --max-events $(PRODUCER_EVENTS)
 
 .PHONY: kafka-offsets
 kafka-offsets: ## Print per-partition end offsets for the topic
-	$(COMPOSE) exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh \
-	  --bootstrap-server localhost:9092 --topic $${WS_KAFKA_TOPIC:-wiki.recentchange}
+	$(COMPOSE) exec -T kafka $(KAFKA_BIN)/kafka-get-offsets.sh \
+	  --bootstrap-server $(KAFKA_INTERNAL) --topic $(TOPIC)
+
+.PHONY: kafka-tail
+kafka-tail: ## Print the first N records on the topic (N=5 by default)
+	$(COMPOSE) exec -T kafka $(KAFKA_BIN)/kafka-console-consumer.sh \
+	  --bootstrap-server $(KAFKA_INTERNAL) --topic $(TOPIC) \
+	  --from-beginning --max-messages $${N:-5} \
+	  --property print.key=true --property print.partition=true
 
 .PHONY: kafka-lag
 kafka-lag: ## Print consumer group lag for the streaming jobs
-	$(COMPOSE) exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
-	  --bootstrap-server localhost:9092 --describe --all-groups
+	$(COMPOSE) exec -T kafka $(KAFKA_BIN)/kafka-consumer-groups.sh \
+	  --bootstrap-server $(KAFKA_INTERNAL) --describe --all-groups
+
+# -------------------------------------------------------------- measurement
+#
+# Every number in docs/ comes from one of these four targets. They are here so a
+# reader can regenerate a figure rather than take it on trust, and so a figure that
+# has gone stale can be spotted by rerunning it.
+
+.PHONY: measure-throughput
+measure-throughput: ## Ingest rate, compression ratio and partition balance. Needs `make up-core`.
+	@bash scripts/measure_throughput.sh $(PRODUCER_SECONDS) $(PRODUCER_EVENTS)
+
+.PHONY: measure-compression
+measure-compression: ## Compare compression codecs on live payloads. Needs `make up-core`.
+	@bash scripts/compare_compression.sh $(PRODUCER_EVENTS) $(PRODUCER_SECONDS)
+
+.PHONY: measure-lag
+measure-lag: ## Source lag distribution, which is where the watermark comes from
+	$(UV) run python scripts/measure_source_lag.py --seconds $(LAG_SECONDS)
+
+.PHONY: explain-partitions
+explain-partitions: ## Why one Kafka partition takes most of the traffic. No network.
+	$(UV) run python scripts/analyse_partitioning.py
 
 # ---------------------------------------------------------------- lakehouse
 
