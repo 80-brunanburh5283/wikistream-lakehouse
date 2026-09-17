@@ -101,8 +101,14 @@ def session_properties(settings: Settings | None = None) -> dict[str, str]:
         # Hadoop committer's `_SUCCESS`/`_temporary` dance costs S3 round trips
         # for nothing here.
         "spark.hadoop.mapreduce.fileoutputcommitter.marksuccessfuljobs": "false",
-        # Adaptive execution coalesces post-shuffle partitions, which is the other
-        # half of not producing tiny files.
+        # Adaptive execution coalesces post-shuffle partitions. Note what this does
+        # and does not cover: Spark disables AQE inside streaming queries and says
+        # so at start-up ("spark.sql.adaptive.enabled is not supported in streaming
+        # DataFrames/Datasets and will be disabled"), so for the bronze and silver
+        # streams the line above about shuffle partitions is the only lever. This
+        # setting is doing real work only in the batch jobs that share this session
+        # builder: `scripts/rebuild_silver.py`, `scripts/maintain_tables.py` and
+        # `scripts/table_stats.py`.
         "spark.sql.adaptive.enabled": "true",
         "spark.sql.adaptive.coalescePartitions.enabled": "true",
         # UTC everywhere. The source timestamps are UTC, Iceberg stores
