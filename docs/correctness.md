@@ -87,6 +87,26 @@ A gate nobody has seen fail is not a gate, so
 `tests/integration/test_silver_rebuild.py::test_the_gate_fails_when_a_duplicate_is_inserted`
 inserts a duplicate row into a scratch table and asserts the script exits non-zero.
 
+### The backfill path is the same proof at a larger scale
+
+```bash
+make rebuild-silver FROM=2026-09-17 TO=2026-09-17
+```
+
+The rebuild reads a date range out of `bronze.recentchange_raw` and pushes it through
+the same projection and the same `MERGE` the live stream uses — the code path is shared
+deliberately, via `frames_from_bronze`, so a bug in one cannot be absent from the other.
+Which makes it a replay test with no fixtures involved. On 2026-09-17, against a silver
+table already holding every one of those events:
+
+```
+silver batch merged   batch_id: -1   valid_rows: 450725   quarantined_rows: 0
+silver.edits now holds           721,366 rows
+```
+
+450,725 rows re-merged, and the row count before and after is 721,366 either way. The
+`batch_id: -1` marks the batch as a rebuild rather than a micro-batch in the log.
+
 ## 2. Restart idempotency
 
 ### The window Spark cannot close for you
@@ -398,6 +418,21 @@ because the most common reason to be in that table is not having a usable `event
 The Kafka coordinates are the only identifier every quarantined row is guaranteed to
 have, and they make the quarantine write a MERGE — so it is idempotent under replay
 for the same reason the main write is. ADR-0021.
+
+### The live stream has never triggered a single rule
+
+Worth saying, because it is the sort of thing a page like this usually leaves out. In
+721,366 events ingested on 2026-09-17, `silver.quarantine` received **zero rows**.
+Wikimedia's `recentchange` payloads are well-formed, every one of them carries
+`meta.id`, `meta.dt` and `meta.domain`, and none arrived with a broken clock.
+
+Live traffic has therefore tested only the passing side of every rule, 721,366 times.
+The failing side is exercised by `tests/fixtures/adversarial.jsonl` and by nothing
+else: the parity test proves the Python and SQL versions agree, and
+`test_each_invalid_frame_landed_in_quarantine_with_its_reason` proves each reason code
+fires on the frame built to trigger it. That is a limitation of the evidence rather
+than of the rules, and the honest reading is that the quarantine is a working mechanism
+whose threat model has not yet materialised.
 
 ### What loud does not mean
 
