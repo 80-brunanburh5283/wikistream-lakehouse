@@ -45,24 +45,12 @@ frame had a bad `meta.dt`. So bronze uses `try_to_timestamp` and lets the null
 travel: the row still lands with its payload intact, and silver's quarantine step
 is what reports it. `tests/spark/test_bronze_mapping.py` holds this down.
 
-## Offsets, and the one flag that looks reckless
+## Where the source options live
 
-`startingOffsets=earliest` applies only on the very first run of a checkpoint.
-Afterwards the checkpoint's offset log wins and this option is ignored — which is
-the whole mechanism behind restart safety, and also why deleting a checkpoint
-directory silently re-reads the topic from the beginning.
-
-`failOnDataLoss=false` deserves its own paragraph, because it is the kind of flag
-that a reviewer is right to be suspicious of. It tells Spark to continue when the
-offsets it recorded no longer exist on the broker. Here the topic's retention is
-24 hours, so a laptop that is shut for two days *will* come back to a checkpoint
-pointing at expired offsets, and the alternative behaviour — refusing to start —
-turns "I closed my laptop" into a manual checkpoint deletion. The cost is real:
-data that expired while the job was down is skipped rather than reported, and
-nothing in the pipeline can distinguish that from a quiet period. That is
-acceptable for bronze because bronze's guarantee is "everything Kafka still had",
-not "everything Wikimedia ever sent" — and it would not be acceptable in a system
-where Kafka were the system of record.
+`startingOffsets`, `failOnDataLoss` and the per-batch bound are in
+`wikistream.streaming.kafka_source`, shared with silver, and the reasoning for each
+is in that module's docstring. Bronze and silver must read the topic with identical
+semantics; the only thing that differs between them is the checkpoint.
 """
 
 from __future__ import annotations
@@ -75,11 +63,12 @@ from pyspark.sql import functions as F
 
 from wikistream.config import get_settings
 from wikistream.logging import configure_logging, get_logger
+from wikistream.streaming.kafka_source import read_kafka
 from wikistream.streaming.schema import PARSE_OPTIONS, PARSE_SCHEMA
 from wikistream.streaming.session import build_session, checkpoint_location
 
 if TYPE_CHECKING:
-    from pyspark.sql import DataFrame, SparkSession
+    from pyspark.sql import DataFrame
     from pyspark.sql.streaming.query import StreamingQuery
 
     from wikistream.config import Settings
@@ -106,34 +95,6 @@ BRONZE_COLUMNS = (
     "ingested_at",
     "ingest_date",
 )
-
-
-def read_kafka(
-    spark: SparkSession,
-    settings: Settings,
-    topic: str | None = None,
-    *,
-    starting_offsets: str = "earliest",
-) -> DataFrame:
-    """Open the Kafka source. Returns the raw Kafka columns, untransformed."""
-    return (
-        spark.readStream.format("kafka")
-        .option("kafka.bootstrap.servers", settings.kafka_bootstrap_servers)
-        .option("subscribe", topic or settings.kafka_topic)
-        .option("startingOffsets", starting_offsets)
-        # See the module docstring: this is a deliberate trade, not an oversight.
-        .option("failOnDataLoss", "false")
-        # Bound the work per micro-batch. Without this, the first batch after a
-        # long outage tries to read every retained record at once, and a 12 GB box
-        # meets an executor OOM instead of catching up steadily. 20,000 is about
-        # six minutes of stream at the measured 51 events/s.
-        .option("maxOffsetsPerTrigger", "20000")
-        # Kafka consumer group management is Spark's, not ours: it commits offsets
-        # to the checkpoint, not to Kafka. Naming the group prefix anyway makes
-        # `kafka-consumer-groups.sh --describe` show something recognisable.
-        .option("groupIdPrefix", settings.kafka_consumer_group)
-        .load()
-    )
 
 
 def to_bronze_rows(kafka_df: DataFrame) -> DataFrame:
