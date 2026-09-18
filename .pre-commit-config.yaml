@@ -63,6 +63,15 @@ repos:
         pass_filenames: false
         types_or: [python, pyi]
 
+      - id: check-doc-links
+        name: markdown links resolve
+        entry: uv run python scripts/check_doc_links.py
+        language: system
+        # Whole-tree, not per-file: the link that breaks when you reword a heading
+        # lives in a file you did not touch.
+        pass_filenames: false
+        files: \.md$
+
       - id: no-instruction-files
         name: no instruction files staged
         # These are local build notes. Committing one would publish how the repo

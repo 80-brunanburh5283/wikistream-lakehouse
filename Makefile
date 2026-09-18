@@ -282,12 +282,17 @@ dagster-validate: ## Load the definitions and check them, without Docker
 # ------------------------------------------------------------------- quality
 
 .PHONY: lint
-lint: ## ruff check + ruff format --check + sqlfluff
+lint: ## ruff check + ruff format --check + sqlfluff + Markdown links
 	$(UV) run ruff check .
 	$(UV) run ruff format --check .
 	@sql=$$(git ls-files '*.sql'); \
 	if [ -n "$$sql" ]; then $(UV) run sqlfluff lint $$sql; \
 	else echo "sqlfluff: no tracked .sql files yet"; fi
+	$(MAKE) --no-print-directory check-links
+
+.PHONY: check-links
+check-links: ## Resolve every relative Markdown link and heading anchor
+	$(UV) run python scripts/check_doc_links.py
 
 .PHONY: format
 format: ## Rewrite files with ruff format and ruff --fix
