@@ -23,6 +23,7 @@ read path.
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
 from typing import Any
 
 import duckdb
@@ -52,8 +53,15 @@ def show(cursor: Any) -> None:
     truncates to the terminal width and prints a row-count footer, and this output
     is read next to `make query`'s.
     """
-    columns = [description[0] for description in cursor.description]
-    rows = [["NULL" if value is None else str(value) for value in row] for row in cursor.fetchall()]
+    show_rows(
+        [description[0] for description in cursor.description],
+        cursor.fetchall(),
+    )
+
+
+def show_rows(columns: list[str], values: list[Any]) -> None:
+    """The same aligned table, for rows assembled in Python rather than by one query."""
+    rows = [["NULL" if value is None else str(value) for value in row] for row in values]
     widths = [
         max(len(column), *(len(row[i]) for row in rows)) if rows else len(column)
         for i, column in enumerate(columns)
@@ -118,6 +126,30 @@ def connect() -> Any:
     return connection
 
 
+def table_listing(connection: Any) -> Iterator[tuple[str, str, int]]:
+    """Every table in the attached catalog, with how many columns it has.
+
+    The column count needs a `DESCRIBE` per table rather than `len(column_names)` from
+    `SHOW ALL TABLES`. DuckDB attaches an Iceberg catalog lazily, so until a table is
+    touched `SHOW ALL TABLES` reports it with the placeholder `['__']` and type
+    `UNKNOWN` — which renders as a plausible-looking `columns = 1` for every table in
+    the lakehouse. `DESCRIBE` loads the metadata, which is the point of the section:
+    the schema comes from the same Iceberg metadata Spark wrote, not from a local
+    definition.
+    """
+    tables = connection.execute(
+        f"""
+        SELECT schema, name
+        FROM (SHOW ALL TABLES)
+        WHERE database = '{CATALOG_ALIAS}'
+        ORDER BY schema, name
+        """
+    ).fetchall()
+    for schema, name in tables:
+        described = connection.execute(f'DESCRIBE {CATALOG_ALIAS}."{schema}"."{name}"').fetchall()
+        yield schema, name, len(described)
+
+
 def report(connection: Any) -> None:
     """The three questions worth asking from outside the JVM."""
     settings = get_settings()
@@ -126,16 +158,7 @@ def report(connection: Any) -> None:
 
     heading("1. DuckDB lists the tables Spark created")
     explain("This process has no Spark, no Trino and no JVM. It asked the catalog.")
-    show(
-        connection.execute(
-            f"""
-            SELECT schema, name, len(column_names) AS columns
-            FROM (SHOW ALL TABLES)
-            WHERE database = '{CATALOG_ALIAS}'
-            ORDER BY schema, name
-            """
-        )
-    )
+    show_rows(["schema", "name", "columns"], list(table_listing(connection)))
 
     heading("2. The same row counts, read from the same Parquet")
     explain(
@@ -160,7 +183,7 @@ def report(connection: Any) -> None:
             f"""
             SELECT wiki, count(*) AS edits, max(event_time) AS newest_event
             FROM {edits}
-            WHERE NOT is_canary
+            WHERE domain <> 'canary'
             GROUP BY wiki
             ORDER BY edits DESC
             LIMIT 10

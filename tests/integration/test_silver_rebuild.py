@@ -24,6 +24,7 @@ behind as evidence rather than poisoning the next run.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import shutil
 import uuid
@@ -33,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from stack import REPO_ROOT, SPARK_SQL_SCRIPT, compose, query, spark_submit
 
-from wikistream.config import Settings
+from wikistream.config import Settings, get_settings
 from wikistream.producer.kafka_sink import KafkaSink
 from wikistream.sources.base import SourceEvent
 
@@ -154,6 +155,21 @@ def merged() -> Iterator[dict[str, Any]]:
             f"rm -rf {env['WS_CHECKPOINT_ROOT']}",
         )
         admin.delete_topics([topic])
+
+
+def _load_duckdb_report() -> Any:
+    """Import `scripts/query_duckdb.py` by path.
+
+    Same reason as `tests/unit/test_doc_links.py`: `scripts/` is a directory of entry
+    points, not a package, and it stays that way rather than gaining an `__init__.py`
+    for a test's convenience.
+    """
+    path = REPO_ROOT / "scripts" / "query_duckdb.py"
+    spec = importlib.util.spec_from_file_location("query_duckdb", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _counts(merged: dict[str, Any]) -> dict[str, int]:
@@ -495,3 +511,54 @@ def test_maintenance_preserves_every_row(merged: dict[str, Any]) -> None:
     ):
         assert step in result.stdout, f"{step} did not run"
     assert _counts(merged) == before
+
+
+def test_duckdb_reads_the_same_tables_and_agrees_on_the_counts(
+    merged: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`make query-duckdb`, run in-process against the tables Spark just wrote.
+
+    Two things are being checked and only one of them is arithmetic.
+
+    The arithmetic is the cross-engine claim: a third engine with no JVM, no cluster
+    and no configuration file in this repository reads the same manifests and reaches
+    the same row counts Spark reports. Spark wrote these tables inside a container; the
+    counts on the right of these assertions came from Spark and the ones on the left
+    from a Python process on the host. Nothing exported anything in between.
+
+    The other thing is that the script runs at all. `report()` is called for its
+    exceptions, not its output: it is a `make` target whose three queries no test
+    executed until this one, and it shipped for two phases with a `WHERE NOT is_canary`
+    against a column that has never existed in `silver.edits` — a filter Spark, Trino
+    and ruff all have no opinion about, because none of them reads this file.
+    """
+    duckdb = pytest.importorskip("duckdb")
+    module = _load_duckdb_report()
+
+    for name, value in merged["env"].items():
+        monkeypatch.setenv(name, value)
+    get_settings.cache_clear()
+
+    bronze = f'ice."{merged["env"]["WS_BRONZE_NAMESPACE"]}".recentchange_raw'
+    edits = f'ice."{merged["env"]["WS_SILVER_NAMESPACE"]}".edits'
+    try:
+        with module.connect() as connection:
+            module.report(connection)
+            counts = connection.execute(
+                f"""
+                SELECT
+                    (SELECT count(*) FROM {bronze}),
+                    (SELECT count(*) FROM {edits}),
+                    (SELECT count(DISTINCT event_id) FROM {edits})
+                """
+            ).fetchone()
+    except duckdb.HTTPException as error:  # pragma: no cover - network shape, not logic
+        pytest.skip(f"duckdb could not fetch an extension: {error}")
+    finally:
+        get_settings.cache_clear()
+
+    spark_counts = _counts(merged)
+    assert counts is not None
+    assert counts[0] == spark_counts["bronze"]
+    assert counts[1] == spark_counts["edits"]
+    assert counts[2] == spark_counts["edits"], "the dedup invariant has to hold in DuckDB too"
