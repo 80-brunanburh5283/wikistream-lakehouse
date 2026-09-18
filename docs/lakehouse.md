@@ -201,7 +201,7 @@ descendant in one invocation.
 
 **MinIO stores each object as a directory.** `/data/lakehouse/warehouse/.../data/`
 contains one directory per *partition*, and each of those contains one directory per
-object, named `00000-123-xxxx.parquet`, holding the parts and an `xl.meta`. So
+object, named `00000-123-9f4c1a2e.parquet`, holding the parts and an `xl.meta`. So
 `ls -1 .../data | wc -l` counts partitions and not files, and the object count needs
 `ls -1d .../data/*/*.parquet`. The 141 MiB versus 139.4 MiB gap is those directory
 entries plus block rounding on 74 objects.
