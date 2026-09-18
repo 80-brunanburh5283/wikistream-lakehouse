@@ -36,6 +36,7 @@ def quote_list(values: Sequence[str]) -> str:
 
 
 def row_count(table: str) -> str:
+    """The one number every observation carries, so a table's growth is visible per run."""
     return f"select count(*) as rows from {table}"
 
 
@@ -192,6 +193,11 @@ def unknown_quarantine_reasons(table: str, known: Sequence[str]) -> str:
 
 
 def quarantine_observation(table: str) -> str:
+    """Rows, newest failure and distinct reasons for the quarantine table.
+
+    Three numbers rather than one because they answer different questions: whether the
+    table is empty because the data is clean, and whether one reason dominates.
+    """
     return (
         "select count(*) as rows, "
         "max(failed_at) as last_failed_at, "
