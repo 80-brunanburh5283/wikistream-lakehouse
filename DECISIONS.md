@@ -2421,3 +2421,65 @@ What this does not fix: two *separate* dbt invocations still see different cutof
 a mart built at 01:48 and another built at 01:52 do not agree. Nothing here is a
 distributed transaction. The claim is narrower and worth stating exactly: within one
 dbt run, every model reads the same set of events.
+
+---
+
+## ADR-0047 — Check Markdown links with a script in this repository, not with lychee
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+This repository is judged largely on its prose, and the prose is heavily
+cross-linked: the README points at 19 of the 47 architecture decision records by
+heading anchor, and the seven pages under `docs/` reference each other and the ADRs. A link
+to a heading that has since been reworded still renders as a link. It sends the
+reader to the top of the page instead of to the section they were promised, and
+nothing in `make lint`, `make test` or CI notices.
+
+That failure mode is specific and it is the one that matters here: the reviewer this
+repository is written for clicks an ADR link out of the README, lands nowhere in
+particular, and concludes that the document is decoration. So the anchors need to be
+checked, not just the file paths.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| A script in `scripts/`, with unit tests | Chosen. |
+| [lychee](https://github.com/lycheeverse/lychee) | The obvious answer, and the one `BUILD_PHASES.md` suggested. It is a Rust binary, so it means a `cargo`-built tool or a GitHub Action in CI and a separate install for a contributor running `make lint` locally — and the checks in this repository are deliberately the same command in both places. It also resolves external URLs by default, which makes the lint fail when somebody else's site is down. |
+| A marketplace action (`markdown-link-check` and similar) | Runs in CI only. A check a contributor cannot run before pushing is a check they discover by breaking the build. |
+| `github-slugger` through Node | The correct slug algorithm, from the package GitHub's own tooling uses — at the cost of a `package.json` and a Node toolchain in a repository that otherwise has one language. |
+| Check file paths only, skip anchors | Half the value. Every broken link found while writing this was an anchor; the paths were fine, because a missing file is obvious the first time you click it. |
+
+### Decision
+
+`scripts/check_doc_links.py`, wired into `make lint` (so CI runs it without a new
+job), into pre-commit, and tested by `tests/unit/test_doc_links.py`.
+
+It reimplements GitHub's slug algorithm — drop everything that is not a letter,
+digit, `_` or `-`, lowercase, turn spaces into hyphens, then suffix repeats with
+`-1`, `-2` — and the test cases are real headings from this repository rather than
+invented ones, because the failure mode of a hand-written slugifier is that it agrees
+with GitHub on `## Simple Heading` and disagrees on exactly the punctuation in use
+here. The em dash in every ADR heading is why the anchors carry a double hyphen; the
+backticks around every identifier vanish; `Spark's` becomes `sparks`. Three separate
+attempts at this got it wrong before there was a test.
+
+Two details are there because the repository needs them rather than because a general
+tool would have them. Fenced blocks are blanked before parsing, keeping the line count
+intact, because the README quotes console output and a mermaid diagram and both
+contain text shaped like a heading or a link. And `../blob/main/…`, the form
+`.github/PULL_REQUEST_TEMPLATE.md` uses so that its links resolve from a pull-request
+page, is understood and checked against the repository root rather than skipped.
+
+External URLs are out of scope, deliberately. A lint that fails because a third party
+is having an outage teaches people to pass `--no-verify`.
+
+### Consequence
+
+18 more unit tests, one more thing in `make lint`, and no new dependency in
+`pyproject.toml`. The cost is that the slug rules are now this repository's problem:
+if GitHub changes them, the tests pass and the links break. That is a real risk and a
+small one — the algorithm has been stable for years — and it is cheaper than the Node
+toolchain the alternative brings.
