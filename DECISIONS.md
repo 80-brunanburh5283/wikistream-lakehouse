@@ -2738,3 +2738,71 @@ The general rule this leaves behind, and the reason it is an ADR rather than a c
 message: a test that pins third-party behaviour should assert the invariant the
 documentation depends on, not the observed behaviour that happens to produce it. Four
 identical runs are not a specification.
+
+---
+
+## ADR-0052 — Pin the Spark and Python versions against Dependabot, not just its majors
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+Within twenty minutes of the repository going public, Dependabot opened three pull
+requests and all three were red:
+
+| PR | Bump | CI |
+|---|---|---|
+| #1 | `python` image 3.12.14 → 3.14.7 | unit + Spark jobs failed |
+| #2 | `spark` image 4.0.4 → 4.2.0 | unit, Spark and **both integration** jobs failed |
+| #3 | `pyspark` 4.0.4 → 4.2.0 | unit + Spark jobs failed |
+
+The unit and Spark failures were mine and unrelated — the branches predate the fix that
+parses dbt's manifest before the tests that import it. What mattered was #2's integration
+failure: `scripts/init_tables.py` exited 1 inside the Spark analyzer. The image was built
+from a Spark 4.2 base with the Spark 4.0 Iceberg runtime and 4.0 Kafka connector jars
+still in it, because Dependabot rewrites the `FROM` line and nothing else, while
+`docker/spark.Dockerfile` carries the version in four more places: `ARG SPARK_VERSION`,
+the `-4.0_` written into the `iceberg-spark-runtime` coordinate, and the pinned sha256 of
+each jar.
+
+Two further facts settled it. Iceberg publishes one Spark runtime per Spark *minor*
+version, and on 2026-09-18 the newest is `iceberg-spark-runtime-4.1_2.13` — there is no
+4.2 artifact on Maven Central at all, so no correctly coordinated bump to Spark 4.2 was
+available to write. And `pyproject.toml` pins `requires-python = ">=3.12,<3.13"`, so the
+3.14 base image in #1 could not have installed this project even if every test had passed.
+
+The existing rule was `dependency-name: "apache/spark"`, `semver-major` only. It had never
+matched anything: the Dockerfile says `FROM spark:...`, the Docker Hub official image, and
+Dependabot names that `spark`. A stale rule that silently matches nothing is worse than no
+rule, because it reads as covered.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Correct the name to `spark` and ignore minor as well as major, for the image, `pyspark` and the `python` image, with the reasoning in the file | Chosen. The three bumps that cannot be taken stop arriving; patch bumps, which can, still do. |
+| Merge #2 and #3 together and fix the Dockerfile by hand | There is nothing to merge onto: Iceberg has no Spark 4.2 runtime. This becomes possible for 4.1 and is then a deliberate afternoon, not a bot's pull request. |
+| Close the three by hand and change nothing | They come back next Monday. The config would keep describing a policy it does not implement. |
+| Ignore *all* updates to the data-stack images | Throws away the patch bumps that are exactly what a bot is good for — a Kafka or MinIO CVE fix should arrive without a human noticing it first. |
+| Teach Dependabot the whole matrix — one group spanning the `docker` and `uv` ecosystems | Not expressible. Groups are per-ecosystem, and the third coupled thing, the Iceberg jar coordinate, is a string inside a `RUN` line that no ecosystem sees. |
+
+### Decision
+
+`.github/dependabot.yml` ignores major and minor updates for `spark` (docker), `python`
+(docker) and `pyspark` (uv), and each ignore carries the reason next to it — including the
+`curl` against Maven Central that says which Spark minors Iceberg actually supports, so
+the next reader can check whether the constraint still holds instead of trusting a comment
+from 2026.
+
+### Consequence
+
+The Spark version now moves when someone decides to move it, across five places in one
+commit, with `make test-integration` as the gate. Patch-level bumps to every image and
+every library still arrive weekly and are still reviewable.
+
+The part worth keeping is the mechanism, not the pins: a version that appears in more than
+one file, in more than one ecosystem, or inside a string is a version a dependency bot
+cannot bump correctly. Either it is derived from a single source, or it is on the ignore
+list with an explanation. Half-measures — the `apache/spark` rule that matched nothing for
+the whole build — are the failure mode, and it took a real pull request against a public
+repository to expose it, which is an argument for publishing earlier rather than later.

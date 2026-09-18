@@ -19,6 +19,15 @@ updates:
         patterns: ["ruff", "mypy", "pytest*", "sqlfluff", "pre-commit"]
       data-stack:
         patterns: ["pyspark", "confluent-kafka", "dbt-*", "dagster*", "duckdb", "trino"]
+    # pyspark is the driver half of a pair whose other half is the `spark` image in
+    # docker/spark.Dockerfile — a different ecosystem, which Dependabot cannot group
+    # with this one. So a minor bump arrives as two pull requests that are each red
+    # alone, and the docker block below names the third thing that has to move with
+    # them. Patch bumps still come through; land them together.
+    ignore:
+      - dependency-name: "pyspark"
+        update-types:
+          ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: "docker"
     directories:
@@ -30,14 +39,36 @@ updates:
     open-pull-requests-limit: 3
     commit-message:
       prefix: "build"
-    # Spark, Iceberg and Trino only work in tested combinations; a major bump is
+    # Spark, Iceberg and Trino only work in tested combinations; a bump across one is
     # a compatibility-matrix exercise, not a version bump, so it gets raised
     # deliberately rather than by a bot.
     ignore:
-      - dependency-name: "apache/spark"
-        update-types: ["version-update:semver-major"]
+      # `spark`, not `apache/spark`: docker/spark.Dockerfile says `FROM spark:...`,
+      # the Docker Hub official image, and that is the name Dependabot uses. The rule
+      # here said `apache/spark` until 2026-09-18 and therefore matched nothing — it
+      # took a real pull request to notice.
+      #
+      # Minor as well as major, because a Spark minor version is not a number here, it
+      # is a coordinate: `iceberg-spark-runtime-<minor>_2.13` has to exist for it. On
+      # 2026-09-18 the newest Iceberg publishes is `-4.1_2.13`; there is no 4.2 build.
+      #   curl -sS 'https://search.maven.org/solrsearch/select?q=g:org.apache.iceberg+AND+a:iceberg-spark-runtime*&rows=50&wt=json' \
+      #     | jq -r '.response.docs[].a'
+      # A real bump also moves ARG SPARK_VERSION, the `-4.0_` written into the jar
+      # coordinate, four pinned sha256 checksums, and `pyspark` in the block above.
+      # Dependabot rewrites the FROM line and nothing else, which is how its 4.2.0
+      # pull request produced a 4.2 runtime loading 4.0 jars and an analyzer failure.
+      - dependency-name: "spark"
+        update-types:
+          ["version-update:semver-major", "version-update:semver-minor"]
       - dependency-name: "apache/iceberg-rest-fixture"
         update-types: ["version-update:semver-major"]
+      # pyproject.toml pins `requires-python = ">=3.12,<3.13"`, so a 3.13+ base image
+      # cannot install this project at all — the container build fails before any test
+      # runs. The version is also fixed in .python-version, .pre-commit-config.yaml and
+      # PYTHON_VERSION in both workflows: five files, one decision, not a bot's.
+      - dependency-name: "python"
+        update-types:
+          ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
