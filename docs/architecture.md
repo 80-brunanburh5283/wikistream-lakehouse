@@ -209,8 +209,10 @@ differs rather than differing by an endpoint. The local properties come from
 | `.s3.access-key-id`, `.s3.secret-access-key` | MinIO's local defaults | **removed** — the EMR job role supplies credentials |
 | `.client.region` | `us-east-1` (MinIO ignores it) | the module's region, `eu-central-1` by default |
 
-Five of the ten properties exist only because MinIO is not S3, which is a fair
-summary of how much of a local lakehouse is scaffolding. The catalog *name* is a
+Six of these properties disappear on Glue: two because Glue is not a REST catalog, and
+four because MinIO is not S3 — the endpoint override, path-style access and the two
+static credentials. That is a fair summary of how much of a local lakehouse is
+scaffolding. The catalog *name* is a
 client-side property, so keeping it `lakehouse` keeps every table identifier in every
 query and every dbt model byte-identical; `modules/glue/main.tf` spells it
 `glue_catalog` in its comment because that is the convention in AWS documentation,

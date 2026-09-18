@@ -4,6 +4,14 @@ Short records of the decisions that were not obvious, written when the decision
 was made rather than reconstructed afterwards. Each one names what was rejected,
 because a decision with no rejected alternative is not a decision.
 
+Six are exceptions and say so in their own headers. ADR-0040 to ADR-0045 record the
+platform choices — the queue, the table format, the stream processor, the
+orchestrator, the query engine, the object store — which were settled before the
+first commit and written down afterwards, when the README needed each row of its
+decisions table to point at an argument. A backfilled record is worth less than a
+contemporaneous one, so they are marked rather than dated as if they were written on
+the day.
+
 Newest last.
 
 ---
@@ -2016,3 +2024,285 @@ the first would wait for itself. None of the paths this project exercises does, 
 the runs above, but a pool of one is the configuration where that bug would appear as
 a stuck query rather than as contention. Moving to Postgres is the fix if it ever
 does, and the connection string is the only thing that would change.
+
+---
+
+## ADR-0040 — Kafka over Redpanda, and KRaft because there is no longer a choice
+
+**Date:** 2026-09-18 · **Status:** accepted · **Recorded retrospectively:** the choice
+was made when the stack was assembled on 2026-09-17
+
+### Context
+
+The queue is one of the four skills this repository exists to demonstrate, and it is
+the one with the clearest market signal: Kafka is named in 32.3% of the job adverts
+this project was designed against, and no alternative broker is named in any of them.
+That is a reason to think hard about it, not a reason on its own — a broker chosen for
+a keyword would show. The technical question is whether a laptop-scale pipeline should
+run a JVM broker.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Apache Kafka, `apache/kafka:4.1.2` | Chosen. |
+| Redpanda | Wire-compatible, one static binary, no JVM, and it would have cost less memory. Rejected on what it would remove from the demonstration rather than on merit: the operational surface I want to be able to discuss in an interview — consumer group rebalances, `kafka-consumer-groups.sh` output, log segments, retention — is Kafka's own, and protocol compatibility is not the same as running the thing. Kafka's measured peak here is 761 MiB (`make measure-resources`), which a 12 GB box can afford. |
+| Kinesis or Pub/Sub | Both cost money, which hard rule 1 forbids, and Pub/Sub has no offsets, which would delete the completeness check described in `docs/architecture.md`. |
+| No queue — SSE straight into Spark | Spark has no SSE source, so it would mean a custom receiver. More importantly it removes the replayable buffer, and without a buffer the restart proof has nothing to replay from: `make test-e2e` works because killing the writer loses nothing that Kafka still holds. |
+
+### Decision
+
+One Kafka broker in KRaft mode, three partitions, 24-hour retention, zstd compression
+(ADR-0014), keyed by wiki domain (ADR-0008).
+
+**KRaft is not a decision, and that is the interesting part.** Kafka 4.0 completed
+KIP-500 and removed ZooKeeper entirely, so `apache/kafka:4.1.2` has no ZooKeeper mode
+to choose. It is recorded here because most Kafka-on-Docker material still shows a
+two-container compose file with a `zookeeper` service, and a reviewer who has seen that
+shape may read its absence as an omission. It is the opposite: the single-container
+broker is what the current release supports.
+
+### Consequence
+
+Every Kafka command in the `Makefile` — `kafka-offsets`, `kafka-lag`, `kafka-tail`,
+`create-topics` — is a call to Kafka's own shell scripts rather than to a wrapper, so
+the commands a reviewer runs locally are the commands that would work against MSK. The
+cost is a JVM: 761 MiB resident at peak, second only to Spark and Trino, and the reason
+`make up-core` exists at all is that this container plus Spark plus MinIO is the
+smallest set that can still land an Iceberg table.
+
+---
+
+## ADR-0041 — Iceberg over Delta Lake and Hudi
+
+**Date:** 2026-09-18 · **Status:** accepted · **Recorded retrospectively:** the choice
+was made when the stack was assembled on 2026-09-17
+
+### Context
+
+The table format is the layer that makes this a lakehouse rather than a directory of
+Parquet, and all three candidates provide the thing that matters: atomic commits over
+object storage, so a reader never sees half a write. Choosing between them is
+therefore not a question about ACID. It is a question about which properties this
+particular pipeline needs to *demonstrate*.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Apache Iceberg 1.10.1 | Chosen. |
+| Delta Lake | The format I would expect at a Databricks shop, and Databricks appears in 16.1% of the advert sample, so this was a real candidate. Rejected on the reader story: this repository's central interoperability claim is that three engines read the same bytes, and `make query` (Trino) plus `make query-duckdb` (DuckDB, no JVM, no configuration) is how it is checked. Delta outside Spark is possible and is a narrower path. |
+| Apache Hudi | The strongest of the three at upsert-heavy CDC, with record-level indexes this workload would not use. Rejected because the write path is a configuration exercise — table type, index type, compaction mode — and because its reader ecosystem is the narrowest of the three. If the source were a database's change log rather than an event stream, this row would read differently. |
+| Plain Parquet with Hive-style partition directories | No atomic commit, so no `MERGE`, so no deduplication guarantee and no restart proof. This is what the project would be without a table format, and naming it is the clearest statement of what the format buys. |
+
+### Decision
+
+Iceberg, on four specific properties rather than on general preference:
+
+1. **Snapshot metadata is queryable SQL.** `.snapshots`, `.files`, `.manifests` and
+   `.history` are tables. Every file-count, size and compaction figure in
+   `docs/lakehouse.md` is a `SELECT`, which is what makes the maintenance story
+   measurable instead of assertable.
+2. **Hidden partitioning.** Bronze partitions by ingest date and silver by event date
+   (ADR-0017), and no query in the repository — Spark, Trino, dbt or DuckDB — names a
+   partition column to get partition pruning. A Hive-style layout leaks that into every
+   `WHERE` clause.
+3. **`MERGE INTO` as a first-class statement** on the format's own primitives, which is
+   where the deduplication guarantee lives (ADR-0020).
+4. **A REST catalog specification with a working reference implementation**, so the
+   catalog is a documented HTTP protocol rather than a vendor runtime — and the AWS
+   substitution to Glue changes one client property.
+
+### Consequence
+
+The bill for this choice is visible in the same documents that praise it. Small files:
+1,177 files for 214 MiB on bronze, because a 30-second trigger commits four files per
+partition every time. That needs a maintenance job (`make maintain`), and the
+compaction it performs is measured — 73 files to 1, 92 to 1 — in `docs/lakehouse.md`.
+Every query plan reads manifests before it reads data, which is why the lifecycle rule
+in `docs/cost.md` deliberately leaves the `metadata/` prefix in the expensive storage
+class. A format that commits atomically commits *something* atomically, and that
+something is a file per partition per batch.
+
+---
+
+## ADR-0042 — Spark Structured Streaming over Flink
+
+**Date:** 2026-09-18 · **Status:** accepted · **Recorded retrospectively:** the choice
+was made when the stack was assembled on 2026-09-17
+
+### Context
+
+Flink is the better stream processor on the merits: genuine per-record processing
+rather than micro-batch, a lower latency floor, richer and more explicit state
+handling, and event-time semantics that were designed in rather than added. A
+streaming portfolio project that picks Spark should be able to say why, because "I
+already know PySpark" is a reason about the author and not about the system.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Spark Structured Streaming 4.0.4 | Chosen. |
+| Apache Flink | Its advantage is latency the workload does not need, and its Iceberg integration would move the correctness argument somewhere harder to show. Detail below. |
+| Kafka Streams or ksqlDB | No Iceberg sink. The lakehouse is the point. |
+| A Python consumer writing Parquet with PyIceberg | Genuinely lighter, and it would remove 2.8 GB of resident set. Rejected because it removes the engine that makes the guarantee: no `MERGE`, no checkpointed offsets, no exactly-once commit protocol — those would all have to be hand-rolled, and hand-rolled exactly-once is how pipelines lose data quietly. |
+
+Two specifics on the Flink row, since it is the row a reviewer would push on.
+
+**The latency argument does not favour Flink here.** Measured end-to-end p99 is 30
+seconds, and that number is the trigger interval I chose, not a limit the engine
+imposed. The 30-second trigger is a file-count decision — every trigger is an Iceberg
+commit, and every commit writes files and metadata — so the binding constraint on
+freshness is the table format, which Flink shares. Where Flink's sub-second floor
+would matter, this pipeline would still be committing to Iceberg every few seconds and
+drowning in small files.
+
+**The deduplication pattern has no clean Flink equivalent.** Silver deduplicates with
+`MERGE INTO … WHEN NOT MATCHED THEN INSERT` inside `foreachBatch` (ADR-0020): the
+guarantee is a SQL statement against the table's current state, which is why it holds
+across restarts, across a rebuild, and across a mid-batch kill. The Flink version keeps
+keys in RocksDB state and relies on the sink's equality deletes, which moves the
+argument from something a reader can execute into something they have to trust me about
+the state backend.
+
+### Decision
+
+Spark, with one engine doing streaming, maintenance and ad-hoc SQL — which is also
+2.8 GB of resident set once rather than twice.
+
+### Consequence
+
+Micro-batch quantises latency to the trigger, and the measured distribution shows it
+exactly: p50 of 15.3 s against a 30 s trigger is what a uniform arrival rate inside a
+fixed window looks like. Both facts a reviewer might hold against the choice — the
+quantised latency and the 3.99 files per commit — are consequences of the same
+parameter, and both are measured rather than described.
+
+---
+
+## ADR-0043 — Dagster over Airflow, deliberately and against the market
+
+**Date:** 2026-09-18 · **Status:** accepted · **Recorded retrospectively:** the choice
+was made when the stack was assembled on 2026-09-17
+
+### Context
+
+I use Airflow daily and have for years. In the advert sample this project was designed
+against, Airflow appears in 41.9% and Dagster in 16.1%. Choosing Airflow would have
+matched more adverts and taken less time. I chose Dagster anyway, and the reasoning
+matters more than the outcome because it is the one place where this repository
+deliberately does not optimise for keyword coverage.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Dagster | Chosen. |
+| Airflow | Rejected for this repository, not on merit. It demonstrates something my CV already claims, so building with it would have added nothing a reader could not already infer. And the model fits badly: Airflow schedules tasks, and the three things at the centre of this pipeline are not scheduled. Expressing "this table is being continuously written by a process I do not start" needs a sensor pretending to be a dependency. |
+| Prefect | Closer to Dagster's model than to Airflow's, and a smaller answer to the same question. It does not appear in the advert sample; Dagster appears in 16.1% of it. |
+| Temporal | Named in some of the adverts I am aiming at, and the wrong tool: a durable workflow engine for application logic, with no asset graph, no data-quality checks and no dbt integration. |
+| No orchestrator | The streams run themselves, so this is tempting. But then nothing owns the marts, nothing owns the health checks, and "is the pipeline healthy?" has no answer that is not a human running a query. |
+
+### Decision
+
+Dagster, using the parts of its model that Airflow has no equivalent for:
+
+- **External assets.** The producer and the two Spark queries are real nodes with real
+  edges that Dagster does not execute (ADR-0030). That is an honest picture of the
+  system rather than a scheduling fiction.
+- **Asset checks as artefacts.** `silver_edits_are_fresh` and
+  `bronze_offsets_are_contiguous` are objects in the graph with their own history, not
+  tasks that raise. A reviewer clicking an asset sees whether its checks have been
+  passing.
+- **The dbt integration.** 7 models and 61 tests map into the same graph as the
+  streaming tables, so one lineage view spans Kafka to marts.
+
+### Consequence
+
+The repository shows both halves without pretending: Airflow is on the CV, Dagster is
+in the code, and the README says which is which. The cost is 745 MiB across two
+containers (webserver 195, daemon 550) and one design constraint that keeps surprising
+me as the right call — the schedules ship *stopped*, because a laptop that wakes up at
+03:00 to compact a table is a laptop whose owner turns the project off.
+
+---
+
+## ADR-0044 — Trino as the engine dbt compiles against
+
+**Date:** 2026-09-18 · **Status:** accepted · **Recorded retrospectively:** the choice
+was made when the stack was assembled on 2026-09-17
+
+### Context
+
+The marts have to be built by something. Spark is already running and can execute SQL,
+so adding a second query engine needs a justification beyond variety — it is the
+second-largest memory consumer in the stack at 1,668 MiB peak.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Trino 483, via `dbt-trino` | Chosen. |
+| Spark SQL via `dbt-spark` | One engine for everything, no extra container, and a Thrift server to run and keep alive. Rejected because it would make the interoperability claim untestable: if Spark writes and Spark reads, "the storage is open" is an assertion. It also couples mart builds to the machine running the streams. |
+| DuckDB via `dbt-duckdb` | The lightest option by far. Rejected as the primary path because the marts must be *written* to Iceberg for Dagster to maintain them and for the checks to read them, and the DuckDB Iceberg extension in this stack is a reader — `scripts/query_duckdb.py` says so in its own docstring. Kept as the third reader instead, which is a better use of it. |
+| ClickHouse | Named in some of the same adverts, and a different storage model: fast because the data is in its own format, which would mean copying out of the lakehouse and giving up the single-copy property. |
+
+### Decision
+
+Trino, on three grounds: it reads the Iceberg catalog Spark commits to with no copy and
+no sync job; it is named explicitly in the adverts I am aiming at; and Athena *is*
+Trino, so the AWS substitution in
+`docs/architecture.md` is an adapter swap plus three connection values rather than a
+rewrite of seven models.
+
+### Consequence
+
+1,668 MiB of resident set for a container that does nothing until a query arrives,
+which is why it sits in the `full` profile and not the default one. `make up-core`
+skips it, and `make query-duckdb` reads the same tables there — so the low-memory path
+is not a degraded path for a reader who only wants to see the data. dbt's `threads: 4`
+against this catalog is also what surfaced the SQLite locking problem in ADR-0039.
+
+---
+
+## ADR-0045 — MinIO over LocalStack for the object store
+
+**Date:** 2026-09-18 · **Status:** accepted · **Recorded retrospectively:** the choice
+was made when the stack was assembled on 2026-09-17
+
+### Context
+
+Iceberg needs object storage, and the pipeline must cost nothing, so S3 is out. The
+question is which S3 substitute, and the answer shapes more than it looks: object
+storage semantics are why the small-file problem exists, why `docs/cost.md` can price
+requests rather than only bytes, and why the Spark catalog needs ten properties.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| MinIO | Chosen. |
+| LocalStack | Emulates a hundred AWS services when this project needs one, and its S3 is the free-tier part of a product whose value proposition is testing infrastructure code against a fake AWS. That is precisely the line hard rule 2 draws: `infra/aws/` is a design artefact that has never been applied, and pointing it at an emulator would let the repository imply otherwise. Being clear about what has not been run is worth more than a green plan against a simulator. |
+| `moto` or `s3mock` | Test doubles. Fine inside a test, not a store to run a lakehouse on for a day and then measure. |
+| A local filesystem warehouse (`file:///`) | Simplest of all, and it would delete the interesting part. No request costs, no eventual-consistency reasoning, no path-style access, no `S3FileIO` — and the file-count problem stops being a cost story and becomes an inode story. The measurements in `docs/cost.md` exist because the local store behaves like the remote one. |
+
+### Decision
+
+MinIO from `quay.io/minio/minio`, one node, one bucket, with the container's own
+documented default credentials.
+
+The credentials deserve a sentence because a reviewer will grep for them.
+`minioadmin` / `minioadmin` is what the image ships with and what its documentation
+prints; it is in `.env.example` and in `docker-compose.yml` in plain text on purpose,
+because a fake credential that is obviously the vendor default is safer than one that
+looks real enough for someone to wonder. There is no secret in this repository to
+leak, and CI runs `gitleaks` to keep it that way.
+
+### Consequence
+
+658 MiB resident, a console on port 9001 that a reviewer can click through to see the
+Parquet, and four of the ten Spark catalog properties existing only because MinIO is
+not S3 — the endpoint override, path-style access and the two static credentials, all
+of which `docs/architecture.md` lists as *removed* in its Glue column. That table is
+the clearest thing I can show about how much of a local lakehouse is scaffolding.
