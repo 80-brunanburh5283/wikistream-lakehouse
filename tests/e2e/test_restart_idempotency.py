@@ -23,11 +23,18 @@ believes it never consumed. On restart it re-reads that exact range and applies 
 again.
 
 Landing a SIGKILL inside that window would be a flake — the window is milliseconds
-wide. So the kill is real and the window is made deterministic: the job is killed while
-it is streaming, and then `commits/N` is deleted, which leaves the checkpoint in
-precisely the state an interrupted commit leaves it in. The re-read is therefore
-guaranteed rather than hoped for, and this test prints how many Kafka records it
-covered.
+wide. So the kill is real and the window is widened deliberately: the job is killed
+while it is streaming, and then `commits/N` is deleted, which leaves the checkpoint in
+the state an interrupted commit leaves it in. The re-read is therefore guaranteed rather
+than hoped for, and this test prints how many Kafka records it covered.
+
+What the deletion does *not* fix is how many batches end up unconfirmed. A kill inside a
+batch leaves an extra `offsets/N+1` and a kill between triggers does not, so the
+checkpoint is one of two shapes and which one is a race. That distinction turned out to
+matter to exactly one assertion — see
+`test_once_is_not_a_reliable_way_to_resume_an_unconfirmed_batch`, which is where the
+consequence is written down. Every duplicate-suppression assertion holds in both shapes,
+which is the point of the proof.
 
 ## What it deliberately does not claim
 
@@ -369,6 +376,13 @@ def crash_and_restart() -> Iterator[dict[str, Any]]:
         print(f"[4] deleting commits/{replayed_batch}: {replayed_records} records unconfirmed")
         removed = compose("exec", "-T", "spark", "rm", f"{checkpoint}/commits/{replayed_batch}")
         assert removed.returncode == 0, removed.stderr
+        # Spark writes `offsets/N` before running batch N, so a kill inside a batch leaves
+        # one more offset file than commit file even before the deletion above. Printed
+        # because it is the only thing that differs between the two outcomes step 6 has
+        # been seen to produce, and a run that does not print it cannot explain itself.
+        planned = _numeric_entries(f"{checkpoint}/offsets")
+        uncommitted = [batch for batch in planned if batch >= replayed_batch]
+        print(f"    offsets {planned}, so batches {uncommitted} are now unconfirmed")
 
         print(f"[5] restarting the producer for {SECOND_PRODUCER_SECONDS}s")
         producer = _start_producer(topic, SECOND_PRODUCER_SECONDS)
@@ -418,6 +432,7 @@ def crash_and_restart() -> Iterator[dict[str, Any]]:
             "offsets_at_crash": offsets_at_crash,
             "offsets_after_restart": offsets_after_restart,
             "committed_before_crash": committed,
+            "uncommitted_after_deletion": uncommitted,
             "once_returncode": once.returncode,
             "once_error": once_error,
         }
@@ -502,24 +517,45 @@ def test_the_duplicate_gate_agrees(crash_and_restart):
     assert result.returncode == 0, "\n".join(result.stdout.splitlines()[-30:])
 
 
-def test_once_cannot_resume_an_unconfirmed_batch(crash_and_restart):
-    """A characterisation test: `--once` is not the way to restart a crashed stream.
+def test_once_is_not_a_reliable_way_to_resume_an_unconfirmed_batch(crash_and_restart):
+    """A characterisation test, and the one that had to be weakened after it flaked.
 
-    `--once` uses `Trigger.AvailableNow`, and on a checkpoint whose newest batch has
-    offsets but no commit it re-runs that batch, merges it correctly, and then fails
-    writing the commit file that it is in the middle of writing:
+    `--once` uses `Trigger.AvailableNow`. Against a checkpoint whose newest batch has
+    offsets but no commit it does one of two things, both observed:
 
-        Multiple streaming queries are concurrently using .../commits
+        exit 1  [STREAM_FAILED] ... Multiple streaming queries are concurrently
+                using .../commits. SQLSTATE: XXKST     (2026-09-17, and the three runs
+                                                        before it: one unconfirmed batch)
+        exit 0  resumes, merges, commits, exits clean   (2026-09-18: two unconfirmed
+                                                        batches, because the SIGKILL
+                                                        landed inside a batch and left
+                                                        an extra `offsets/N`)
 
-    No second query exists. The MERGE has already happened, so no data is lost or
-    duplicated — the run simply exits non-zero and the batch stays unconfirmed. The
-    continuous trigger recovers the same checkpoint without complaint, which is what
-    step [7] of the fixture does and what `make stream-silver` uses.
+    No second query exists in either case. The first version of this test asserted the
+    failure, because that is what every run until 2026-09-18 did; then one resumed
+    cleanly and the assertion was wrong rather than the pipeline. Step [4] now prints the
+    unconfirmed set, so a future run says which shape it had instead of leaving the next
+    reader to guess.
 
-    This is asserted rather than merely written down because it decides which command a
-    reader should reach for after a crash. If it ever fails, Spark has fixed the
-    AvailableNow path: delete this test and the paragraph it guards in
-    `docs/correctness.md`.
+    What is invariant is what an operator actually needs, and it is asserted below and in
+    the six tests above: neither outcome loses or duplicates a row, and the continuous
+    trigger recovered the same checkpoint in both — step [7] would have timed out
+    otherwise. That is why the runbook says to restart a crashed stream with
+    `make stream-silver` and not `make stream-silver-once`: not because `--once` always
+    fails, but because it sometimes does and the alternative never has.
     """
-    assert crash_and_restart["once_returncode"] != 0
-    assert "concurrently using" in crash_and_restart["once_error"], crash_and_restart["once_error"]
+    outcome = crash_and_restart["once_returncode"]
+    if outcome != 0:
+        # A failure for a *different* reason would mean something new is broken, and
+        # silently accepting any non-zero exit would hide it.
+        assert "concurrently using" in crash_and_restart["once_error"], (
+            f"--once failed in a way this test has not seen: {crash_and_restart['once_error']}"
+        )
+    assert crash_and_restart["uncommitted_after_deletion"], (
+        "step [4] left nothing unconfirmed, so step [6] was not the scenario this test names"
+    )
+    after = crash_and_restart["after_restart"]
+    assert after["rows"] == after["ids"], (
+        f"the continuous trigger recovered a checkpoint --once exited {outcome} on, "
+        f"but left {after['rows'] - after['ids']} duplicate rows"
+    )

@@ -2664,5 +2664,70 @@ The Makefile's "every target is a compose command in plain sight" property now h
 documented exception, with the reason in the script's header and in the comment above the
 targets. A graceful stop leaves a complete batch in the checkpoint, which is why
 `make stream-bronze-once` works immediately afterwards — measured resuming at batch 218
-with zero offsets behind — where after a crash it hits the concurrent-query error and
-`make stream-bronze` is the documented recovery. Runbook entry 12 covers the orphan case.
+with zero offsets behind — where after a crash it may hit the concurrent-query error
+([ADR-0051](#adr-0051--assert-the-invariant-a-flaky-characterisation-test-was-standing-in-for))
+and `make stream-bronze` is the documented recovery. Runbook entry 12 covers the orphan
+case.
+
+---
+
+## ADR-0051 — Assert the invariant a flaky characterisation test was standing in for
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+`tests/e2e/test_restart_idempotency.py` carried a seventh test asserting that
+`make stream-silver-once` — `Trigger.AvailableNow` — *cannot* resume a checkpoint whose
+newest batch has offsets but no commit. Four consecutive runs produced the same failure,
+`[XXKST] Multiple streaming queries are concurrently using .../commits`, with no second
+query in existence, so the test asserted exit code non-zero and that error string. It
+guarded a section of `docs/correctness.md` and a line in runbook entry 6 that both tell
+an operator to restart a crashed stream with the continuous trigger.
+
+On 2026-09-18 the fifth run exited 0. `--once` resumed the unconfirmed batch, merged it,
+committed, and left 2,497 rows with 2,497 distinct event ids. The pipeline was right and
+the assertion was wrong.
+
+The fixture deletes `commits/N` deliberately, so the unconfirmed batch is not a race. What
+*is* a race is how many batches are unconfirmed afterwards: Spark writes `offsets/N` before
+running batch N, so a SIGKILL landing inside a batch leaves an extra offsets file and a
+SIGKILL landing between triggers does not. One unconfirmed batch or two, decided by
+millisecond timing, and `AvailableNow` evidently handles the two-batch shape and refuses
+the one-batch shape. The failing run's own output shows it: `committed [0, 1]` before the
+kill, and `committed [0, 2, 3]` after recovery, with batch 2 planned before the crash.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| Assert only what does not vary — the failure mode *if* it fails, that something was left unconfirmed, and zero duplicates after recovery — and print the unconfirmed set on every run | Chosen. The test still fails if a new error appears or a duplicate survives, which is what it was for; it no longer fails on a coin toss. |
+| Keep asserting the failure and mark the test `flaky`/retry | A retried assertion about third-party behaviour is not evidence of anything. It would also have kept a false sentence in `docs/correctness.md`, which is worse than a missing one. |
+| Delete the test and the section it guards | Throws away a real operational finding. The recovery advice is still correct and still worth a reader's time; only its premise needed weakening. |
+| Force the one-batch shape — stop the stream between triggers, then delete `commits/N` | Makes the assertion deterministic, but by turning a crash test into a graceful-stop test. The distinction it would then be measuring is the one `docs/correctness.md` already covers separately, and the crash path is the one worth exercising. |
+| Reproduce Spark's internals to explain *why* the two shapes differ, then assert the mechanism | Time spent characterising someone else's recovery path, and a test that would break on their next release for reasons this project does not care about. What an operator needs is which command to use, and that answer did not change. |
+
+### Decision
+
+The test is `test_once_is_not_a_reliable_way_to_resume_an_unconfirmed_batch`. It asserts
+three things: a non-zero exit carries the known error and not a new one; step [4] really
+did leave a batch unconfirmed, so the scenario happened; and the table the continuous
+trigger recovered holds one row per event id. Step [4] now prints the offsets directory
+and the resulting unconfirmed set, so a future run explains its own shape instead of
+leaving the next reader to guess which of the two it hit.
+
+`docs/correctness.md` now says `--once` *may* fail, records both outcomes with dates, and
+states the advice on the weaker premise: restart with the continuous trigger not because
+`--once` always fails, but because it sometimes does and the alternative never has.
+
+### Consequence
+
+One claim in the repository got weaker and the test suite got more honest. The five
+duplicate-suppression assertions — the actual proof — were unaffected in every run, which
+is the useful signal: the property this project asserts about *its own* code held under
+both checkpoint shapes, and the assertion that broke was about Spark's.
+
+The general rule this leaves behind, and the reason it is an ADR rather than a commit
+message: a test that pins third-party behaviour should assert the invariant the
+documentation depends on, not the observed behaviour that happens to produce it. Four
+identical runs are not a specification.

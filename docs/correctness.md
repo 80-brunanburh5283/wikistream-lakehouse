@@ -141,39 +141,40 @@ One run on 2026-09-18, with the single long exception line wrapped and nothing e
 changed:
 
 ```
-[1] producing into wikistream.e2e.2d26d799 for up to 70s
-    239 records on the topic
+[1] producing into wikistream.e2e.71b12f18 for up to 70s
+    285 records on the topic
 [2] starting the silver stream, 10s trigger
-    committed batches [0, 1]
+    committed batches [0, 1, 2]
 [3] SIGKILL both, mid-flight
-    silver holds 877 rows, 877 distinct ids; topic at 1015
-[4] deleting commits/1: 302 records unconfirmed
+    silver holds 893 rows, 893 distinct ids; topic at 1046
+[4] deleting commits/2: 98 records unconfirmed
+    offsets [0, 1, 2], so batches [2] are now unconfirmed
 [5] restarting the producer for 40s
-    topic at 2508, and static from here
+    topic at 2470, and static from here
 [6] trying to resume the unconfirmed batch with --once
     exit 1: pyspark.errors.exceptions.captured.StreamingQueryException: [STREAM_FAILED]
-    Query [id = d34130c1-...] terminated with exception: Multiple streaming queries are
-    concurrently using file:/opt/spark/checkpoints/e2e-2d26d799/silver_edits/commits.
-    SQLSTATE: XXKST
+    Query [id = 4e35ff4a-..., runId = 94af6ec5-...] terminated with exception: Multiple
+    streaming queries are concurrently using
+    file:/opt/spark/checkpoints/e2e-71b12f18/silver_edits/commits. SQLSTATE: XXKST
 [7] resuming with the continuous trigger, the way the pipeline runs
-    committed [0, 1, 2]
-    silver holds 2508 rows, 2508 distinct ids
-[8] replaying commits/2 (1631 records), no new data
-    silver holds 2508 rows, 2508 distinct ids
+    committed [0, 1, 2, 3]
+    silver holds 2470 rows, 2470 distinct ids
+[8] replaying commits/3 (1577 records), no new data
+    silver holds 2470 rows, 2470 distinct ids
 .......
-================ 7 passed, 382 deselected in 243.69s (0:04:03) =================
+================ 7 passed, 383 deselected in 229.31s (0:03:49) =================
 ```
 
-Reading it in order: the crash left 877 rows and 877 distinct ids; deleting
-`commits/1` put 302 already-merged records back into the unconfirmed state; the
-restarted producer took the topic to 2,508 records; and after the restart the table
-held 2,508 rows and 2,508 distinct ids — one per record on the topic, no more and no
+Reading it in order: the crash left 893 rows and 893 distinct ids; deleting
+`commits/2` put 98 already-merged records back into the unconfirmed state; the
+restarted producer took the topic to 2,470 records; and after the restart the table
+held 2,470 rows and 2,470 distinct ids — one per record on the topic, no more and no
 fewer. Step 8 then replays a second already-applied batch and the two counts do not
 move.
 
 Step 8 is the sharp one. With the producer stopped and the topic static, a committed
-batch of 1,817 records is replayed in full, and the row count moves by **exactly
-zero**. An append instead of a MERGE would have added 1,817 rows there.
+batch of 1,577 records is replayed in full, and the row count moves by **exactly
+zero**. An append instead of a MERGE would have added 1,577 rows there.
 
 The numbers differ from run to run — the topic is fed from a live firehose, so how many
 records arrive and how many batches commit before the kill are not fixed. What is fixed
@@ -198,7 +199,7 @@ idempotent write rather than by a distributed transaction.
 
 This came out of the proof and is worth knowing before you need it.
 `--once` uses `Trigger.AvailableNow`. Against a checkpoint whose newest batch has
-offsets but no commit, it re-reads that batch, merges it correctly, and then fails:
+offsets but no commit, it re-reads that batch, merges it correctly, and then *may* fail:
 
 ```
 pyspark.errors.exceptions.captured.StreamingQueryException: [STREAM_FAILED] ...
@@ -207,13 +208,28 @@ file:/opt/spark/checkpoints/.../silver_edits/commits. SQLSTATE: XXKST
 ```
 
 No second query exists. The MERGE has already happened, so nothing is lost or
-duplicated — the run exits non-zero and the batch stays unconfirmed. The continuous
-trigger recovers the same checkpoint without complaint, which is what step 7 above
-does.
+duplicated — the run exits non-zero and the batch stays unconfirmed.
+
+The hedge in "may" is the honest part, and it was not there first. Four consecutive runs
+produced that error, so the test asserted it. The fifth, on 2026-09-18, resumed cleanly
+and exited 0 — and the assertion was wrong rather than the pipeline. The difference is
+how many batches the crash left unconfirmed: a SIGKILL landing *inside* a batch writes
+`offsets/N+1` before it dies, so deleting `commits/N` leaves two unconfirmed batches
+instead of one, and `AvailableNow` handled that case without complaint. The test now
+prints the unconfirmed set on every run for exactly this reason — the transcript above is
+a one-batch run (`offsets [0, 1, 2], so batches [2] are now unconfirmed`) and it failed;
+the run that resumed cleanly had two.
+
+What did not vary across any of the five runs: the continuous trigger recovered the
+checkpoint, and the table held one row per event id afterwards. So the advice stands, on
+a weaker premise than the one it started with — restart with the continuous trigger not
+because `--once` always fails, but because it sometimes does and the alternative never
+has.
 
 This is asserted, not merely written down:
-`test_once_cannot_resume_an_unconfirmed_batch` fails if Spark ever fixes the
-`AvailableNow` path, which is the signal to delete both the test and this section.
+`test_once_is_not_a_reliable_way_to_resume_an_unconfirmed_batch` fails if a non-zero exit
+ever arrives with a *different* error, and fails if the recovered table ever holds a
+duplicate.
 
 A *graceful* stop is the other case and behaves the opposite way. Ctrl-C on
 `make stream-silver` runs Spark's shutdown hook, which finishes the batch in flight and
