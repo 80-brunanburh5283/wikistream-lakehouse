@@ -611,7 +611,11 @@ undocumented is worse.
   rebalance or a failover, which is where distributed systems get difficult.
 - **The ceiling is unknown.** Throughput is bounded by the source, not by the
   pipeline, so there is no load test and no capacity claim. I would rather have no
-  number than an extrapolated one.
+  number than an extrapolated one. What *is* derivable from the measurements is the
+  order in which things would give way — disk first, then the MERGE, then the
+  partition key — and
+  [docs/throughput.md](docs/throughput.md#what-would-break-first-at-100x) works
+  through it, including the two components that turn out not to care.
 - **`infra/aws/` has never been applied and `k8s/` has never been deployed.** Both
   are validated in CI — `terraform validate`, Trivy, `kubeconform --strict` — and
   that is all they are. The AWS README says so in a banner at the top.

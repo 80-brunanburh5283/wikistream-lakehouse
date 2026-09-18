@@ -180,6 +180,49 @@ of outage absorbed before `send` starts blocking and logging. The default would
 absorb four hours and then be OOM-killed by the kernel on a laptop, which converts a
 recoverable broker outage into a lost process and an unexplained restart.
 
+## What would break first at 100x
+
+Reasoning from the numbers above rather than a measurement — there is no load test
+here, and [the README says so](../README.md#known-limitations). But "what breaks
+first" is answerable from arithmetic, and the order is not the obvious one.
+
+The rates measured for this project range from 40.2 to 51.4 events/s depending on the
+hour, so 100x is 4,000–5,100 events/s. Three things do *not* break, and that is the
+interesting part:
+
+- **The producer.** `backpressure_waits` stayed at 0 and the send queue sat at one
+  record, so there is headroom of unknown size — but the source is a single SSE
+  connection, and 100x cannot come out of it. At that rate the input is no longer
+  this input, which makes "scale the producer" the wrong question and "fan in N
+  streams, one process each" the right one.
+- **The Iceberg commit rate.** Commits are driven by the 30-second trigger, not by
+  volume, so the catalog still sees two commits a minute per table. The
+  single-JDBC-connection ceiling from
+  [ADR-0039](../DECISIONS.md#adr-0039--give-the-sqlite-catalog-one-jdbc-connection-instead-of-two)
+  survives 100x untouched, which was not what I expected when I went looking.
+- **Kafka's partition count**, at least for throughput. Three partitions on one
+  broker is a durability limit, not a rate limit.
+
+What does break, in order:
+
+1. **Disk, immediately.** 316 stored bytes per record at 5,100 events/s is 140 GB a
+   day, against a Quickstart that asks for 20 GB free. Retention would have to fall
+   to about three hours for Kafka to fit on a laptop at all, and a three-hour replay
+   buffer is not much of a replay buffer.
+2. **The silver micro-batch, next.** The MERGE rewrites whichever data files hold a
+   matching `event_id`, so 100x the rows per batch is 100x the rewrite while the
+   trigger interval stays at 30 seconds. Past some multiple the batch takes longer
+   than its trigger, batches queue, and the pipeline is permanently behind rather
+   than briefly behind. Nothing here measures where that point is, and that is the
+   honest answer to "how far does this go".
+3. **The keying, structurally.** Balance is already 15.0/26.8/58.3 across three
+   partitions, and not because one wiki is huge: two of the busiest keys hash to the
+   same partition ([above](#partition-balance-worse-than-the-obvious-estimate)). More
+   partitions redistribute that collision rather than removing the mechanism, so the
+   fix is a different key — which costs the per-domain ordering the key exists to
+   provide. That trade is the first *design* decision 100x forces, as opposed to a
+   configuration change, which is why it is on this list at all.
+
 ## Limitations
 
 - One machine, one location, one time of day. Every figure moves with the stream's
