@@ -83,6 +83,39 @@ buying space.
 rewrite. Compaction adds two snapshots before expiry removes any, and the after
 column is measured between the two procedures.
 
+### The same procedures on ten times as many files
+
+The paragraph above is true at the file sizes it was measured at, and false at
+smaller ones. A later run left both tables with hundreds of files instead of dozens,
+and the same `make maintain` behaved differently. Measured 2026-09-18 at 04:24 UTC:
+
+| | bronze before | bronze after | silver before | silver after |
+|---|---|---|---|---|
+| data files | 872 | **1** | 876 | **1** |
+| average file size | 49.0 KiB | 34,438.4 KiB | 30.8 KiB | 13,726.8 KiB |
+| total size | 41.7 MiB | **33.6 MiB** | 26.3 MiB | **13.4 MiB** |
+| snapshots | 218 | 219 | 221 | 223 |
+| rows | 224,683 | 224,683 | 224,683 | 224,683 |
+
+Silver lost half its bytes — 26.3 MiB to 13.4 MiB — where the earlier run lost 2%.
+The difference is rows per file: 224,683 rows across 876 files is about 256 rows each,
+against roughly 4,800 in the run above. Every Parquet file pays for its own footer,
+schema, per-column chunk metadata and dictionaries, and a 256-row file writing a
+dictionary of wiki names and URL prefixes spends most of itself on that dictionary.
+zstd works inside a column chunk, so at that size it never sees enough repetition to
+compress. Merge the files and the fixed costs are paid once and the compressor gets a
+window worth having.
+
+So the honest generalisation is narrower than "compaction is not a compression win":
+**it is not a compression win once your files are already around a megabyte, and it is
+a large one below that.** Which one you are in follows from the trigger interval — a
+30-second trigger on this source writes about 256 rows per batch per table. `make
+table-stats` prints the average file size, and it is the number to look at before
+deciding whether compaction is worth scheduling.
+
+The file *count* collapses either way, and that is the part that matters for query
+planning.
+
 **The compacted file is 69.4 MiB against a 128 MiB target, and stops there.** There
 is nothing left to merge it with. A reader should take the file *count* from this
 table and not the absolute sizes — see the limitations below.
