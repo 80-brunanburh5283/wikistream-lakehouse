@@ -3,7 +3,7 @@
 # Peak resident memory per container, sampled.
 #
 # `docker stats` reports an instant, and the number that decides whether this stack
-# fits in a 12 GB WSL box is the peak — which happens during a Spark micro-batch or a
+# fits in an 11 GB WSL box is the peak — which happens during a Spark micro-batch or a
 # Trino query, not while nothing is running. So this samples and keeps the maximum
 # per container rather than printing one reading.
 #

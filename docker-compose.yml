@@ -86,7 +86,7 @@ services:
       # created by scripts/create_topics.sh, which is explicit about both.
       KAFKA_NUM_PARTITIONS: ${WS_KAFKA_TOPIC_PARTITIONS:-3}
       # 512 MB is comfortable for one broker at ~40 events/s. The image's default
-      # heap is sized for a server, and on a 12 GB laptop the difference decides
+      # heap is sized for a server, and on an 11 GB laptop the difference decides
       # whether Spark also gets to run.
       KAFKA_HEAP_OPTS: "-Xmx512M -Xms512M"
     volumes:
@@ -220,7 +220,7 @@ services:
 
   # ------------------------------------------------------------------- spark
   #
-  # One container, `local[*]` inside it. No separate master and workers: on a 12 GB
+  # One container, `local[*]` inside it. No separate master and workers: on an 11 GB
   # laptop a standalone cluster costs a JVM per role to demonstrate a distribution
   # this workload does not need, and every extra JVM is memory the streaming job
   # cannot have. What matters here — Kafka offsets, Iceberg commits, checkpoint

@@ -21,8 +21,8 @@ disk afterwards. Nothing is estimated and nothing is sampled.
 
 ## Result: one 5,000-frame run
 
-Measured 2026-09-17 at 08:16 UTC, on WSL2 with 10 GB of RAM and 8 vCPUs, against
-`stream.wikimedia.org` from a residential connection in Dhaka.
+Measured 2026-09-17 at 08:16 UTC, on WSL2 with 8 vCPUs and an 11 GB memory
+allocation, against `stream.wikimedia.org` from a residential connection in Dhaka.
 
 | Metric | Value |
 |---|---|
@@ -154,7 +154,7 @@ the right answer for a cluster:
   half the tasks queue, and the skew stops being the constraint before the
   parallelism does.
 - Every partition is a directory of segment files and a slice of consumer state. On
-  a 12 GB box running Kafka, Spark, Trino and Dagster together, twelve of those to
+  an 11 GB box running Kafka, Spark, Trino and Dagster together, twelve of those to
   save 2.4 points of balance is the wrong trade.
 - The skew is *visible* rather than harmful here. Nothing in the pipeline reads a
   single partition, silver's MERGE is keyed on the event id and not the partition,

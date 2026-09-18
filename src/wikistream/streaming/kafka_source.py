@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from wikistream.config import Settings
 
 #: Records per micro-batch, per query. Without a bound, the first batch after a
-#: long outage tries to read everything Kafka retained at once and a 12 GB box
+#: long outage tries to read everything Kafka retained at once and an 11 GB box
 #: meets an executor OOM instead of catching up steadily. 20,000 is about six
 #: minutes of stream at the measured 51 events/s.
 MAX_OFFSETS_PER_TRIGGER = 20_000

@@ -9,7 +9,8 @@ have never been applied ([their README says so](../infra/aws/README.md)), so not
 here is about operating them — where the AWS module *would* change an answer, the
 entry says so and stops there.
 
-Numbers below were measured on one machine — a 12 GB WSL2 instance — on the dates
+Numbers below were measured on one machine — a WSL2 instance with 8 vCPUs and an
+11 GB memory allocation, 10.7 GB of it visible to the kernel — on the dates
 given. They are there to show the shape of a healthy system, not as a benchmark.
 
 ## Orientation
@@ -583,7 +584,7 @@ it. `DECISIONS.md` records that trade.
 
 **Symptom.** A query fails with `EXCEEDED_LOCAL_MEMORY_LIMIT`, or
 `wikistream-trino` disappears and comes back. Trino runs with `mem_limit: 2g` so the
-whole stack fits a 12 GB box, and that headroom is thin by design.
+whole stack fits an 11 GB box, and that headroom is thin by design.
 
 **Diagnose.**
 
@@ -607,7 +608,7 @@ rather than simultaneous, so the sum is an upper bound, not a reading.
 2. Run it somewhere else. `make query-duckdb` reads the same Iceberg tables with no
    JVM and no Trino, which is also the answer if Trino will not start at all.
 3. Raise `mem_limit` for `trino` in `docker-compose.yml`. Only worth doing if the box
-   has the RAM: on a 12 GB machine with the full profile up, it does not.
+   has the RAM: on an 11 GB machine with the full profile up, it does not.
 
 Compaction helps here too, for a reason worth naming: a query against 825 small files
 spends memory on planning that a query against a few large ones does not.

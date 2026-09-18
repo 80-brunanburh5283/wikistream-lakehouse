@@ -145,7 +145,7 @@ jobs:
     name: integration (${{ matrix.shard }})
     runs-on: ubuntu-latest
     # Split in two because the whole suite does not fit the budget. Measured on
-    # 2026-09-18: 22 tests, 10m12s, on a 12 GB WSL box that was also running the
+    # 2026-09-18: 22 tests, 10m12s, on an 11 GB WSL box that was also running the
     # full stack. Adding the image build and four healthchecks to that puts one job
     # at the wrong side of fifteen minutes, and a check nobody waits for is a check
     # nobody reads.
