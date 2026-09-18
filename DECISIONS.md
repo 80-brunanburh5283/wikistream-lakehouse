@@ -2483,3 +2483,73 @@ is having an outage teaches people to pass `--no-verify`.
 if GitHub changes them, the tests pass and the links break. That is a real risk and a
 small one — the algorithm has been stable for years — and it is cheaper than the Node
 toolchain the alternative brings.
+
+---
+
+## ADR-0048 — Run the restart proof on a nightly schedule, not on every pull request
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+`make test-e2e` is the strongest argument this repository makes. It SIGKILLs the
+producer and the streaming job while both are working, deletes a Spark commit file so
+that the replay of an already-applied batch is guaranteed rather than hoped for, and
+then asserts that `silver.edits` still holds one row per event
+([ADR-0025](#adr-0025--make-the-crash-window-deterministic-by-deleting-commitsn)). It
+is also the only test that consumes the live Wikimedia stream, and it takes four
+minutes.
+
+Those two facts pull against each other. A test that proves the central claim of the
+README should not be something a reader has to take on trust. A test that goes red
+because a volunteer-funded public endpoint had a bad night must not be what decides
+whether an unrelated commit can merge. Until now the resolution was "run it by hand",
+which is honest but means the proof quietly rots the first time nobody remembers to.
+
+The same is true of `make smoke-live`, for a different reason: its last check fails
+when the stream carries a field the declared schema does not, which is drift rather
+than an outage — and drift by definition happens without anyone committing anything.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| A scheduled `nightly.yml` | Chosen. |
+| Add both to `ci.yml` | Four minutes onto every pull request, and a red build whenever `stream.wikimedia.org` is unavailable or has changed a field. The signal would be about the world and would look like a verdict on the commit. |
+| Add them to `ci.yml` with `continue-on-error: true` | A check that cannot fail is a check nobody reads. It would also make the overall run green while hiding a real regression in the duplicate-suppression path, which is the one thing here worth being loud about. |
+| Feed the e2e test from the captured fixtures so it can be a gate | The test's own docstring is the reason: a crash-recovery proof run against hand-fed frames is mostly a proof about the frames. The fixture-fed version of this argument already exists and already runs on every push — it is `tests/integration/test_silver_rebuild.py`. |
+| Leave it manual, document that it is manual | What the repository did before this. It survives exactly as long as somebody keeps running it. |
+
+### Decision
+
+`.github/workflows/nightly.yml`, at 03:17 UTC, with two independent jobs: `live source
+contract` (`make smoke-live`, no Docker, one HTTPS connection) and
+`restart-idempotency proof` (`make up-core` then `make test-e2e`). Both write their
+result into the run summary, because a scheduled run nobody opens is a scheduled run
+nobody reads. Neither blocks anything: a failure here is information about the world,
+and GitHub emails the repository owner, which is the whole notification system this
+needs at this size.
+
+Three details are deliberate. The cron minute is off the hour, because GitHub queues
+scheduled workflows and the top of the hour is the most contended slot — a run there
+is delayed by tens of minutes or dropped. The jobs do not `needs:` each other, so a
+field renamed upstream reports as drift *and* the proof still runs, instead of being
+skipped by a dependency. And the proof brings up the core profile rather than the full
+stack: it was measured against `make up-core` alone before the workflow was written —
+seven tests, 4m03s, green — which is 2,413 MiB and two health checks saved for the
+same assertion.
+
+### Consequence
+
+The proof stops depending on somebody remembering it, and `ci.yml` keeps the property
+that a red run means a bad commit.
+
+The honest limitation is that the e2e job has never run on a GitHub-hosted runner and
+cannot until the repository is published, so its first scheduled run is also its first
+test of whether a 4-vCPU runner is enough. What is known rather than hoped: the
+identical `make up-core` step is already green in `ci.yml`'s integration job, and the
+core profile's measured peak is 4,561 MiB of the 16 GB `ubuntu-latest` has.
+
+GitHub also disables scheduled workflows in a public repository after 60 days without
+activity. That is the right behaviour here rather than a problem to work around — a
+dormant repository should stop asking Wikimedia for data.

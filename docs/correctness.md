@@ -137,37 +137,39 @@ millisecond-wide window would be a flake; deleting `commits/N` makes the replay
 certain. ADR-0025 records why that is the honest version of the test and what the two
 rejected designs were.
 
-One run, verbatim, on 2026-09-17:
+One run on 2026-09-18, with the single long exception line wrapped and nothing else
+changed:
 
 ```
-[1] producing into wikistream.e2e.c1a99e57 for up to 70s
-    454 records on the topic
+[1] producing into wikistream.e2e.2d26d799 for up to 70s
+    239 records on the topic
 [2] starting the silver stream, 10s trigger
-    committed batches [0, 1, 2]
+    committed batches [0, 1]
 [3] SIGKILL both, mid-flight
-    silver holds 1368 rows, 1368 distinct ids; topic at 1512
-[4] deleting commits/2: 202 records unconfirmed
+    silver holds 877 rows, 877 distinct ids; topic at 1015
+[4] deleting commits/1: 302 records unconfirmed
 [5] restarting the producer for 40s
-    topic at 3185, and static from here
+    topic at 2508, and static from here
 [6] trying to resume the unconfirmed batch with --once
     exit 1: pyspark.errors.exceptions.captured.StreamingQueryException: [STREAM_FAILED]
-    Query [id = 189b080d-...] terminated with exception: Multiple streaming queries are
-    concurrently using file:/opt/spark/checkpoints/e2e-c1a99e57/silver_edits/commits.
+    Query [id = d34130c1-...] terminated with exception: Multiple streaming queries are
+    concurrently using file:/opt/spark/checkpoints/e2e-2d26d799/silver_edits/commits.
     SQLSTATE: XXKST
 [7] resuming with the continuous trigger, the way the pipeline runs
-    committed [0, 1, 2, 3]
-    silver holds 3185 rows, 3185 distinct ids
-[8] replaying commits/3 (1817 records), no new data
-    silver holds 3185 rows, 3185 distinct ids
+    committed [0, 1, 2]
+    silver holds 2508 rows, 2508 distinct ids
+[8] replaying commits/2 (1631 records), no new data
+    silver holds 2508 rows, 2508 distinct ids
 .......
-================ 7 passed, 313 deselected in 222.44s (0:03:42) =================
+================ 7 passed, 382 deselected in 243.69s (0:04:03) =================
 ```
 
-Reading it in order: the crash left 1,368 rows and 1,368 distinct ids; deleting
-`commits/2` put 202 already-merged records back into the unconfirmed state; the
-restarted producer took the topic to 3,185 records; and after the restart the table
-held 3,185 rows and 3,185 distinct ids — one per record on the topic, no more and no
-fewer.
+Reading it in order: the crash left 877 rows and 877 distinct ids; deleting
+`commits/1` put 302 already-merged records back into the unconfirmed state; the
+restarted producer took the topic to 2,508 records; and after the restart the table
+held 2,508 rows and 2,508 distinct ids — one per record on the topic, no more and no
+fewer. Step 8 then replays a second already-applied batch and the two counts do not
+move.
 
 Step 8 is the sharp one. With the producer stopped and the topic static, a committed
 batch of 1,817 records is replayed in full, and the row count moves by **exactly

@@ -1,0 +1,153 @@
+# The two checks that cannot be a pull-request gate, on a schedule instead.
+#
+# ci.yml has to stay deterministic: it decides whether a commit is mergeable, so it
+# leaves out everything that depends on the live Wikimedia stream. An outage upstream,
+# or a field renamed by somebody else, would paint an unrelated commit red.
+#
+# "Not a gate" is not the same as "not worth running", and both of the things ci.yml
+# leaves out fail without anyone committing anything — which is what a schedule is for:
+#
+#   the source contract   a new or renamed field upstream means the bronze table
+#                         quietly stops holding everything the stream sent, and the
+#                         declared schema stops being a contract
+#   the restart proof     the duplicate-suppression argument the README makes, run
+#                         against live data with real SIGKILLs rather than fixtures
+#
+# A red run here is information about the world rather than about a commit, so it
+# blocks nothing. GitHub emails the repository owner when a scheduled run fails; that
+# is the notification this has, and it is enough for a project of this size.
+name: nightly
+
+on:
+  schedule:
+    # 03:17 UTC, deliberately not on the hour. GitHub queues scheduled workflows and
+    # the top of the hour is the most contended slot, where a run is delayed by tens
+    # of minutes or dropped outright. The minute is arbitrary; the hour is one where
+    # the failure mail gets read.
+    #
+    # GitHub disables scheduled workflows in a public repository after 60 days with no
+    # activity. That is a feature here rather than a problem: a dormant repository
+    # should not keep asking a volunteer-funded endpoint for data.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+# Runs cannot collide on data — every one uses a fresh scratch topic, namespace and
+# checkpoint — but two at once would double what this asks of a public endpoint for no
+# extra information, so a manual dispatch queues behind a nightly instead of joining
+# it.
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.12.15"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  source-contract:
+    name: live source contract
+    runs-on: ubuntu-latest
+    # No Docker, no JVM: one HTTPS connection and twenty frames. If this is slow, the
+    # source is unreachable, and the check says so rather than hanging.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      - name: make smoke-live
+        run: |
+          set -o pipefail
+          make smoke-live 2>&1 | tee /tmp/smoke.txt
+
+      # The five verdicts are the result, and a scheduled run nobody opens is a
+      # scheduled run nobody reads. Putting them in the summary means the answer is on
+      # the run's own page instead of four clicks inside a log.
+      - name: report the verdicts in the run summary
+        if: always()
+        run: |
+          [ -f /tmp/smoke.txt ] || exit 0
+          {
+            echo '### Live source contract'
+            echo
+            echo '```'
+            cat /tmp/smoke.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  restart-proof:
+    name: restart-idempotency proof
+    runs-on: ubuntu-latest
+    # 4m03s of test measured on 2026-09-18 against exactly this profile, plus the Spark
+    # image build and four health checks. The ceiling is generous because the producer's
+    # first seventy seconds depend on how fast the stream is talking, which is not this
+    # job's to control, and because a 4-vCPU runner is slower than the box that number
+    # came from.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - run: uv sync --locked
+
+      # `up-core` and not `up`: the proof talks to Kafka, MinIO, the Iceberg catalog and
+      # the Spark container, runs the producer as a host process, and never queries
+      # Trino or asks Dagster for anything. Verified rather than assumed — the seven
+      # tests were run against `make up-core` alone on 2026-09-18 and passed — which
+      # saves the 2,413 MiB and two health checks the full profile would add to prove
+      # the same thing. No `.env` is written, for the reason ci.yml gives: the defaults
+      # in docker-compose.yml are the configuration a stranger gets.
+      - name: bring up Kafka, MinIO, the Iceberg catalog and Spark
+        run: make up-core
+
+      - name: make test-e2e
+        env:
+          # `pytest -s` writes the trace to a pipe here, and a pipe makes Python
+          # block-buffer: without this the job prints nothing for ten minutes and then
+          # everything at once, which looks exactly like a hang. Observed locally
+          # while piping the same command through `tee`.
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set -o pipefail
+          make test-e2e 2>&1 | tee /tmp/e2e.txt
+
+      # The test prints a numbered trace — records landed, batches committed, the
+      # commit file it deleted, row and distinct-id counts either side of the restart.
+      # That trace is the evidence for the claim, so it belongs on the run page. The
+      # rest of the output is pytest boilerplate.
+      - name: report the proof's trace in the run summary
+        if: always()
+        run: |
+          [ -f /tmp/e2e.txt ] || exit 0
+          {
+            echo '### Restart-idempotency proof'
+            echo
+            echo '```'
+            grep -E '^(\[[0-9]+\]|    )' /tmp/e2e.txt || echo 'the test produced no trace'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Before the teardown, which takes the logs with it. Only on failure: this is
+      # what a maintainer needs in order to tell an upstream outage from a real
+      # regression without reproducing a ten-minute test.
+      - name: service logs
+        if: failure()
+        run: docker compose logs --tail=200
+
+      - name: tear down
+        if: always()
+        run: make down

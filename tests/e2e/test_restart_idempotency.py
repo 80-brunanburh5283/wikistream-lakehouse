@@ -4,8 +4,10 @@
 
 `silver.edits` claims one row per source event. The rest of the suite argues that claim
 on data that behaves; this test breaks the pipeline in the middle of its work and then
-asks whether the claim survived. It is the slowest test here — eight to ten minutes —
-and the only one that kills a running process.
+asks whether the claim survived. It is the slowest test here — 4m03s measured on
+2026-09-18 against the core profile — and the only one that kills a running process.
+Most of that is wall-clock rather than compute: 110 seconds of it is the two bounded
+producer runs below, and the rest is Spark start-ups and waits for commits to land.
 
 ## The two failures it reproduces
 

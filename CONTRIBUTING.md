@@ -43,9 +43,9 @@ There are four levels, and they have different requirements:
 | `make test-unit` | nothing — no network, no Docker, no JVM | 285 tests, 4 s warm |
 | `make test-spark` | a JDK, but no Docker | 75 tests, 67 s |
 | `make test-integration` | `make up-core` | 22 tests, 10 min |
-| `make test-e2e` | `make up`, plus the public internet | several minutes |
+| `make test-e2e` | `make up-core`, plus the public internet | 7 tests, 4 min |
 
-Those three figures were measured on one machine on 2026-09-18 and are there to set
+Those four figures were measured on one machine on 2026-09-18 and are there to set
 expectations, not as a benchmark. The integration suite is slow for one reason: most
 of its ten minutes is JVM start-up, because every assertion about a MERGE has to
 ingest to bronze with one `spark-submit` and then rebuild with another. CI runs it in
@@ -82,10 +82,16 @@ secret scanning.
 
 These are the commands CI runs — `.github/workflows/ci.yml` calls the same targets
 rather than restating them, so a green run there means the same command is green
-here. What CI adds is a scan of every commit in the history for credentials and, in
-`infra.yml`, validation of the Terraform and the Kubernetes manifests. What it
-leaves out is `make test-e2e`, which depends on the live Wikimedia stream: an outage
-upstream would fail a pull request that had nothing to do with it.
+here. What CI adds is a scan of every commit in the history for credentials, a lint
+of the workflow files themselves, and, in `infra.yml`, validation of the Terraform
+and the Kubernetes manifests.
+
+What it leaves out is `make test-e2e`, which depends on the live Wikimedia stream: an
+outage upstream would fail a pull request that had nothing to do with it. That test
+and `make smoke-live` run on a schedule in `nightly.yml` instead, where a red run is
+information about the world rather than a verdict on your change. If you touch the
+streaming path, run `make test-e2e` yourself and say so in the pull request — it
+takes four minutes and it is the only check that proves the restart guarantee.
 
 ## Commit messages
 

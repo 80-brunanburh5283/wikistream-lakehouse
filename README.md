@@ -387,7 +387,7 @@ was setting the test to `warn`.
 | `unit` | 285 | nothing — no network, no Docker, no JVM | yes |
 | `spark` | 75 | a JDK and in-process Spark | yes |
 | `integration` | 22 | `make up-core` | yes, with the core profile |
-| `e2e` | 7 | the full stack, the internet, and minutes | no — it is the restart proof, run by hand |
+| `e2e` | 7 | `make up-core`, the internet, and 4 minutes | nightly, not per commit — it is the restart proof |
 
 `make test` runs the first three. The split matters because it decides what a
 contributor can check before pushing: 285 tests need nothing but Python, which is
@@ -404,8 +404,8 @@ materialisable asset, so an asset added later cannot quietly end up orchestrated
 by nothing. `tests/unit/test_dbt_run_cutoff.py` is the third, and it is there
 because the bug it guards is not reproducible on demand — see property 6 above.
 
-**CI** is two GitHub Actions workflows, free tier only, no cloud credentials
-anywhere in either:
+**CI** is three GitHub Actions workflows, free tier only, no cloud credentials
+anywhere in any of them:
 
 - `ci.yml` — `lint` (ruff, mypy, sqlfluff, `dbt parse`, and a link check that
   resolves every relative link and heading anchor in the Markdown, including the
@@ -415,9 +415,15 @@ anywhere in either:
   every job has a timeout.
 - `infra.yml` — `terraform fmt -check`, `init -backend=false`, `validate`, a
   Trivy config scan, and `kubeconform --strict` over every kustomize overlay.
+- `nightly.yml` — the two checks that must not be a merge gate, on a schedule
+  instead: `make smoke-live`, which fails if the stream carries a field the
+  declared schema does not, and the restart proof. Both depend on a public
+  endpoint, so a failure there is information about the world rather than a verdict
+  on somebody's commit
+  ([ADR-0048](DECISIONS.md#adr-0048--run-the-restart-proof-on-a-nightly-schedule-not-on-every-pull-request)).
 
-Neither workflow can touch AWS: there is no credential, no state file, and no
-`plan` step. That is the point of the module — see the banner at the top of
+No workflow can touch AWS: there is no credential, no state file, and no `plan`
+step. That is the point of the module — see the banner at the top of
 [infra/aws/README.md](infra/aws/README.md).
 
 `.pre-commit-config.yaml` runs the same linters plus gitleaks and a hook that

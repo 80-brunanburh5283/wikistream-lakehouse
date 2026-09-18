@@ -9,8 +9,9 @@
 # Two things are deliberately absent. Terraform and the Kubernetes manifests are in
 # infra.yml, which is path-filtered. And `make test-e2e` — the restart-idempotency
 # proof — is not here at all: it consumes the live Wikimedia stream, so an outage
-# upstream would paint an unrelated commit red, and it takes minutes. It is run by
-# hand, and README.md says so rather than implying CI covers it.
+# upstream would paint an unrelated commit red, and it takes minutes. It runs on a
+# schedule instead, in nightly.yml, where a red run is information about the world
+# rather than a verdict on somebody's commit.
 name: ci
 
 on:

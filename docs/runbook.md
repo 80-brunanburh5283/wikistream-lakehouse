@@ -379,8 +379,9 @@ make verify-no-duplicates    # exits non-zero if silver.edits has any repeated e
 
 Measured 2026-09-18 on 1,218,424 silver rows: zero repeated `event_id`. The hard
 version of this — kill the producer and both streams mid-flight, restart, assert zero
-duplicates — is `make test-e2e`, and it is not run in CI because it consumes the live
-stream.
+duplicates — is `make test-e2e`. It is not a pull-request gate, because it consumes
+the live stream and an outage upstream would fail an unrelated change; it runs on a
+nightly schedule instead, in `.github/workflows/nightly.yml`.
 
 If bronze did pick up duplicate rows, they are not repaired in place: bronze is
 deliberately immutable, and silver was never wrong. The rewrite is available
