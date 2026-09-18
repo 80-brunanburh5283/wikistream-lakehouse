@@ -123,7 +123,7 @@ make dagster-observe      # observe the tables and run their 5 asset checks
 make down                 # stop everything, keep the data
 ```
 
-`make` on its own lists every target with a one-line description. There are 61 of
+`make` on its own lists every target with a one-line description. There are 62 of
 them and that list is the interface — nothing in this README asks you to run a
 script by path.
 
