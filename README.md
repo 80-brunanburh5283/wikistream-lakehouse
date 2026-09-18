@@ -1,5 +1,6 @@
 # wikistream-lakehouse
 
+[![CI](https://github.com/william-sarkar/wikistream-lakehouse/actions/workflows/ci.yml/badge.svg)](https://github.com/william-sarkar/wikistream-lakehouse/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](pyproject.toml)
 
