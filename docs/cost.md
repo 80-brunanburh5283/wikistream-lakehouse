@@ -26,7 +26,9 @@ storage of the data itself.
 | Peak memory, whole stack | 6,974 MiB summed peaks | `make measure-resources` |
 | Peak memory, largest single container | Spark, 2,823 MiB | same |
 | Next two | Trino 1,668 MiB, Kafka 761 MiB | same |
-| Container images | 4.63 GB — Spark 2.37, Dagster 1.14, dbt 0.87, producer 0.25 | `docker images` |
+| Images built here | 4.63 GB — Spark 2.37, Dagster 1.14, dbt 0.87, producer 0.25 | `docker images` |
+| Images on disk, all nine | ~8.6 GB of layers — the four above plus Trino, Kafka, the Iceberg fixture, MinIO and `mc` | `docker system df -v`, summing UNIQUE SIZE and counting each shared base once |
+| First build, no layer cache | 22m50s for all four | `docker compose build --no-cache`, timed |
 | Iceberg table data | 280 MiB after 1,218,424 events | `make table-stats`, 2026-09-18 |
 | Kafka log, steady state | 1.40 GB at 24 h retention | [throughput.md](throughput.md) |
 | Inbound bandwidth | ~6 GB/day of JSON, continuous | 1,368 B/event × 51.4 events/s |
@@ -132,14 +134,14 @@ hypothetical:
 | Bytes per event, bronze / silver | 166.6 / 74.2 | `make table-stats`, 1,218,424 rows |
 | New table data per day | 1.07 GB | derived from the two rows above |
 | dbt build cadence | every 15 minutes | `src/wikistream_dagster/schedules.py` |
-| Statements per dbt build | 68 — 7 models, 61 tests | dbt manifest, `make dbt-parse` |
+| Statements per dbt build | 69 — 7 models, 62 tests | dbt manifest, `make dbt-parse` |
 | Observation cadence | every 2 minutes | `schedules.py` |
 | Month | 30 days, both streams continuous | — |
 
 Two of those deserve a note. The commit rate is the *nominal* one: at a 30-second
 trigger a stream commits 2,880 times a day, and the measured cadence over a
 15-minute window was one commit every 33.4 seconds, so 2,880 overstates by about
-10%. Overstating is the right direction for a cost model. And the 68 statements per
+10%. Overstating is the right direction for a cost model. And the 69 statements per
 dbt build are what `dbt build` runs — models *and* tests — because that is what the
 Dagster job does, with the tests as asset checks.
 
@@ -155,7 +157,7 @@ Dagster job does, with the tests as asset checks.
 | EMR Serverless, held capacity | 5,760 vCPU-h + 23,040 GB-h, x86 | 501.70 |
 | EMR Serverless, worker disk | ≤ 80 GB × 720 h × $0.000132 | 0.00–7.60 |
 | Interface VPC endpoints | 3 services × 2 AZ × 720 h × $0.012 | 51.84 |
-| Athena | 195,840 queries × 10 MB minimum = 1.96 TB | 9.79 |
+| Athena | 198,720 queries × 10 MB minimum = 1.99 TB | 9.94 |
 | S3, PUT | 1.21M × $0.0054/1,000 | 6.53 |
 | S3, GET | 12.5M × $0.0043/10,000 | 5.39 |
 | CloudWatch Logs | 0.86 GB × $0.63 | 0.57 |
@@ -170,7 +172,7 @@ Sorted by size, that table says something the architecture diagram does not:
 | Being available — the MSK cluster fee and the held EMR workers | 1,149.70 | 92.8% |
 | Being reachable privately — VPC interface endpoints | 51.84 | 4.2% |
 | Moving the data — Kafka ingress and egress, S3 PUTs | 16.61 | 1.3% |
-| Answering questions — Athena, and the S3 GETs behind it | 15.18 | 1.2% |
+| Answering questions — Athena, and the S3 GETs behind it | 15.33 | 1.2% |
 | Everything else — partition-hours, Kafka storage, logs | 4.63 | 0.4% |
 | **Keeping the data** — S3 storage | **0.39** | **0.03%** |
 
@@ -358,11 +360,11 @@ magnitude.
 
 Athena is the same story with the opposite cause. The marts are tiny: a full scan of
 `silver.edits` at the measured size is 86.2 MiB, which is $0.0004. But a `dbt build`
-is 68 statements, 61 of them tests that scan almost nothing, and Athena bills a 10 MB
-minimum per query. Four builds an hour is 195,840 queries a month, and 195,840
-minimum charges is 1.96 TB of billable scan against a few gigabytes of actual reads —
-$9.79 a month, **25 times the cost of storing everything the queries read.** The
-lever here is not partitioning or file size, it is the test schedule: 61 assertions do
+is 69 statements, 62 of them tests that scan almost nothing, and Athena bills a 10 MB
+minimum per query. Four builds an hour is 198,720 queries a month, and 198,720
+minimum charges is 1.99 TB of billable scan against a few gigabytes of actual reads —
+$9.94 a month, **25 times the cost of storing everything the queries read.** The
+lever here is not partitioning or file size, it is the test schedule: 62 assertions do
 not need to run every fifteen minutes, and splitting model builds from test runs would
 remove most of that line without removing a single test.
 

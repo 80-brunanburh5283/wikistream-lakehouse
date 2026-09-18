@@ -100,7 +100,12 @@ coordinates. The MERGE is what makes the pipeline idempotent under replay, and
 
 **5. Silver to gold.** dbt compiles two staging views and five marts through Trino
 against the same Iceberg tables Spark wrote. No extract, no copy, no sync job: Trino
-reads the catalog Spark commits to and sees the current snapshot.
+reads the catalog Spark commits to and sees the current snapshot. Every model bounds
+itself on one ingest-time cutoff per dbt invocation, because the input changes while
+the DAG runs — silver gains a snapshot every 30 seconds and a build takes longer than
+that, so without a shared bound two models read two different worlds and the
+references between them break. [ADR-0046](../DECISIONS.md#adr-0046--bound-every-gold-model-on-one-ingest-time-cutoff-per-dbt-run)
+is the failure that produced the rule.
 
 **6. Everything to Dagster.** The producer and the two streams are *external assets*
 — real nodes with real edges, but not things Dagster starts. What Dagster does run is

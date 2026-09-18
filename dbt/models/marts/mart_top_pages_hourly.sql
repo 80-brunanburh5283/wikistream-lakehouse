@@ -63,6 +63,9 @@ with source_events as (
         -- Canary events have no page at all; this second condition catches the
         -- handful of log events that also arrive without one.
         and edits.page_title is not null
+        -- Shared with dim_wikis, and the reason the relationships test between
+        -- them holds. See macros/run_cutoff.sql.
+        and edits.ingested_at < {{ run_cutoff() }}
         {% if is_incremental() %}
             and edits.event_date >= (
                 select cast(coalesce(max(t.event_hour), {{ epoch_utc() }}) as date)

@@ -61,3 +61,8 @@ is_incremental = {% macro is_incremental() %}true{% endmacro %}
 # has to render to the same literal, or lint would be checking different SQL from
 # the SQL dbt runs — see dbt/macros/epoch_utc.sql.
 epoch_utc = {% macro epoch_utc() %}timestamp '1970-01-01 00:00:00 utc'{% endmacro %}
+# Also restated, and here the *value* is arbitrary where the *shape* is not. At run
+# time this renders `run_started_at`, which sqlfluff has no equivalent of; any zoned
+# timestamp literal parses identically, so lint sees the same SQL structure it would
+# see in production. See dbt/macros/run_cutoff.sql.
+run_cutoff = {% macro run_cutoff() %}timestamp '2026-01-01 00:00:00 utc'{% endmacro %}

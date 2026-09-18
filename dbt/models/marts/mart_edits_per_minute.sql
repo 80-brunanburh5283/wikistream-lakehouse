@@ -51,6 +51,9 @@ with source_events as (
     from {{ ref('stg_edits') }} as edits
     where
         not edits.is_canary
+        -- One cutoff for the whole run, so this mart and the dimension it is
+        -- joined to agree on what arrived. See macros/run_cutoff.sql.
+        and edits.ingested_at < {{ run_cutoff() }}
         {% if is_incremental() %}
         -- Scalar subqueries, so Trino evaluates each once and pushes a constant
         -- into the scan. Cross-joining the same aggregate would give the same

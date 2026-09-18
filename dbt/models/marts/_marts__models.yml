@@ -14,6 +14,16 @@ models:
         data_tests:
           - unique
           - not_null
+      - name: built_through
+        description: >
+          The ingest-time cutoff this table was built to, identical on every row,
+          equal to the `run_started_at` of the dbt invocation that wrote it. Every
+          gold model shares that cutoff so the marts and this dimension describe the
+          same set of events; carrying it as a column is what lets a later `dbt test`
+          invocation recompute a yardstick over exactly those rows. See
+          `macros/run_cutoff.sql` and DECISIONS.md ADR-0046.
+        data_tests:
+          - not_null
       - name: primary_domain
         description: >
           The domain this wiki emitted the most events under. Not a key: see

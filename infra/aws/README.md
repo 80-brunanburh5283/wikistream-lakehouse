@@ -103,7 +103,7 @@ Two kinds of number below, and the difference matters:
 Everything else is an assumption, and each one is named in the line it affects.
 Assumed: 730 hours a month, 7-day Kafka retention, two consumers of the topic,
 30-second micro-batches on two streaming tables, four S3 PUTs per Iceberg commit,
-and a dbt build every 15 minutes running 7 models and 61 tests.
+and a dbt build every 15 minutes running 7 models and 62 tests.
 
 | Line | Arithmetic | USD/month |
 |---|---|---|
@@ -118,13 +118,13 @@ and a dbt build every 15 minutes running 7 models and 61 tests.
 | S3 PUT | 691,200 × $0.0054/1,000 | 3.73 |
 | S3 GET | 3.92 M × $0.0043/10,000 | 1.68 |
 | Glue Data Catalog | 737 k requests, free tier is 1 M | 0.00 |
-| Athena, floor | 195,840 queries × 10 MB minimum = 1.96 TB × $5.00 | 9.79 |
+| Athena, floor | 198,720 queries × 10 MB minimum = 1.99 TB × $5.00 | 9.94 |
 | **Total** | | **≈ 1,452** |
 
 The EMR line assumes both streaming queries hold pre-initialised capacity
 continuously — one driver and two executors each, 2 vCPU and 8 GB per worker,
 which is what the local stack runs. Graviton workers would take that $763.00 to
-$610.50 at the same shape. The Athena line is a floor, not an estimate: at 195,840
+$610.50 at the same shape. The Athena line is a floor, not an estimate: at 198,720
 queries a month the 10 MB per-query minimum dominates, so the *test suite* costs
 more than the models do, and a real figure needs bytes scanned that this
 repository cannot measure without an account.

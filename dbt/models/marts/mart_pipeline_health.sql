@@ -59,6 +59,11 @@ with edit_hours as (
         approx_percentile(late_by_seconds, 0.99) as late_p99_seconds,
         max(late_by_seconds) as late_max_seconds
     from {{ ref('stg_edits') }}
+    -- The run's cutoff, as everywhere else in gold. It also makes this mart's
+    -- newest bucket reproducible: without it, two runs of the same dbt project
+    -- minutes apart would disagree on the percentiles for the current hour and
+    -- neither would be wrong. See macros/run_cutoff.sql.
+    where ingested_at < {{ run_cutoff() }}
     group by event_hour
 ),
 
@@ -68,6 +73,9 @@ quarantine_hours as (
         count(*) as quarantined_events,
         count(distinct failure_reason) as distinct_failure_reasons
     from {{ ref('stg_quarantine') }}
+    -- `failed_at` is this table's ingest clock, so it is the column the cutoff
+    -- applies to. See the header comment on the two clocks.
+    where failed_at < {{ run_cutoff() }}
     group by failed_hour
 )
 

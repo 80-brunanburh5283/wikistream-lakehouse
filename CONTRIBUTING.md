@@ -40,7 +40,7 @@ There are four levels, and they have different requirements:
 
 | Command | Needs | Roughly |
 |---|---|---|
-| `make test-unit` | nothing — no network, no Docker, no JVM | 262 tests, 11 s |
+| `make test-unit` | nothing — no network, no Docker, no JVM | 267 tests, 16 s |
 | `make test-spark` | a JDK, but no Docker | 75 tests, 67 s |
 | `make test-integration` | `make up-core` | 22 tests, 10 min |
 | `make test-e2e` | `make up`, plus the public internet | several minutes |

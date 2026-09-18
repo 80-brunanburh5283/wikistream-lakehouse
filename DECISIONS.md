@@ -468,7 +468,7 @@ ten minutes with no dropped events.
 ### Consequence
 
 Spark retains about `40 events/s x 600 s = 24,000` events of deduplication state
-— small enough to be uninteresting on a 12 GB laptop, which is the honest reason
+— small enough to be uninteresting on an 11 GB laptop, which is the honest reason
 this trade-off was cheap. An outage longer than ten minutes drops the oldest
 events on restart, and the README says so. On a stream two orders of magnitude
 larger the answer would flip to a tighter watermark plus a correction table for
@@ -1624,7 +1624,7 @@ assertions are the missing ones.
 |---|---|
 | Rewrite both tests to read one model each | Deletes the independent yardstick, which is the entire assertion. A mart compared against itself is a tautology. |
 | Reimplement them as hand-written Dagster checks in Python | Two copies of the same SQL, in two languages, to be kept in step by nobody. |
-| Accept the gap and note the count | The count is what a reviewer reads. "61 dbt tests, 59 of them visible" is a footnote nobody will find at the moment it matters. |
+| Accept the gap and note the count | The count is what a reviewer reads. "every dbt test runs, two of them attached to nothing" is a footnote nobody will find at the moment it matters. |
 | Name the asserted model with `meta.dagster.ref` | Chosen. |
 
 ### Decision
@@ -1668,7 +1668,7 @@ documented production answer is Postgres storage, a container per code location
 served over gRPC, and a run launcher that starts a container per run.
 
 This project's constraint is that `make up` must bring the whole stack up inside
-10 minutes on a 12 GB machine that is already running Kafka, MinIO, a Spark driver
+10 minutes on an 11 GB machine that is already running Kafka, MinIO, a Spark driver
 and a 2 GB Trino coordinator.
 
 ### Options
@@ -1982,7 +1982,7 @@ is exactly that path.
 | Option | Rejected because |
 |---|---|
 | `dbt/profiles.yml threads: 1` | It narrows the race without closing it. dbt is not the only writer: both Spark streams commit every micro-batch and would still collide with dbt, so the same error would come back as an occasional failed mart rather than a reproducible one. Intermittent is worse. |
-| Postgres as the catalog backend | The real answer for a real deployment, and what ADR-0038 does for Dagster on Kubernetes. Here it buys a container and about 200 MB of resident set on a 12 GB laptop to serialise a few writes a second, and the thing it would fix is fixed for nothing below. |
+| Postgres as the catalog backend | The real answer for a real deployment, and what ADR-0038 does for Dagster on Kubernetes. Here it buys a container and about 200 MB of resident set on an 11 GB laptop to serialise a few writes a second, and the thing it would fix is fixed for nothing below. |
 | `transaction_mode=IMMEDIATE` on the JDBC URL | Tried, measured, did not work. It makes the driver open transactions with `BEGIN IMMEDIATE`, which would take the write lock up front and turn the upgrade into a wait — but the Iceberg calls that fail run in autocommit, so there is no `BEGIN` for the setting to apply to. The error changed from `SQLITE_BUSY` to `SQLITE_BUSY_SNAPSHOT` and the models kept failing. Removed again. |
 | `clients: 1` on the catalog, plus WAL and a busy timeout | Chosen. |
 
@@ -2010,7 +2010,7 @@ does not exist and the first `CREATE VIEW` fails.
 
 Verified after the change: `make dbt-run` green on six consecutive runs, two of them
 with the bronze and silver streams both committing throughout, and zero `SQLITE_BUSY`
-lines in the catalog log across all six. `make dbt-test` passes 61 tests.
+lines in the catalog log across all six. `make dbt-test` passes 62 tests.
 
 Every catalog operation in the stack now serialises through one connection. At this
 scale that is invisible — a commit is a single-row insert and Trino's metadata reads
@@ -2046,7 +2046,7 @@ run a JVM broker.
 | Option | Rejected because |
 |---|---|
 | Apache Kafka, `apache/kafka:4.1.2` | Chosen. |
-| Redpanda | Wire-compatible, one static binary, no JVM, and it would have cost less memory. Rejected on what it would remove from the demonstration rather than on merit: the operational surface I want to be able to discuss in an interview — consumer group rebalances, `kafka-consumer-groups.sh` output, log segments, retention — is Kafka's own, and protocol compatibility is not the same as running the thing. Kafka's measured peak here is 761 MiB (`make measure-resources`), which a 12 GB box can afford. |
+| Redpanda | Wire-compatible, one static binary, no JVM, and it would have cost less memory. Rejected on what it would remove from the demonstration rather than on merit: the operational surface I want to be able to discuss in an interview — consumer group rebalances, `kafka-consumer-groups.sh` output, log segments, retention — is Kafka's own, and protocol compatibility is not the same as running the thing. Kafka's measured peak here is 761 MiB (`make measure-resources`), which an 11 GB box can afford. |
 | Kinesis or Pub/Sub | Both cost money, which hard rule 1 forbids, and Pub/Sub has no offsets, which would delete the completeness check described in `docs/architecture.md`. |
 | No queue — SSE straight into Spark | Spark has no SSE source, so it would mean a custom receiver. More importantly it removes the replayable buffer, and without a buffer the restart proof has nothing to replay from: `make test-e2e` works because killing the writer loses nothing that Kafka still holds. |
 
@@ -2215,7 +2215,7 @@ Dagster, using the parts of its model that Airflow has no equivalent for:
   `bronze_offsets_are_contiguous` are objects in the graph with their own history, not
   tasks that raise. A reviewer clicking an asset sees whether its checks have been
   passing.
-- **The dbt integration.** 7 models and 61 tests map into the same graph as the
+- **The dbt integration.** 7 models and 62 tests map into the same graph as the
   streaming tables, so one lineage view spans Kafka to marts.
 
 ### Consequence
@@ -2306,3 +2306,118 @@ Parquet, and four of the ten Spark catalog properties existing only because MinI
 not S3 — the endpoint override, path-style access and the two static credentials, all
 of which `docs/architecture.md` lists as *removed* in its Glue column. That table is
 the clearest thing I can show about how much of a local lakehouse is scaffolding.
+
+---
+
+## ADR-0046 — Bound every gold model on one ingest-time cutoff per dbt run
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+`make dbt-build` failed. Not intermittently in some future CI run — on 2026-09-18 at
+01:48, on a stack that had been up for eleven minutes:
+
+```
+ERROR: relationships_mart_top_pages_hourly_wiki__wiki__ref_dim_wikis_
+Got 3 results, configured to fail if != 0
+```
+
+Three rows in `mart_top_pages_hourly` referenced a wiki that `dim_wikis` did not
+contain. Both models are derived from the same staging view over the same table, so
+one of them looked wrong. Neither was:
+
+```sql
+select m.wiki, min(e.ingested_at) as first_ingested, min(e.event_time) as first_event
+from (select distinct wiki from gold.mart_top_pages_hourly) m
+left join lakehouse.silver.edits e on e.wiki = m.wiki
+where m.wiki not in (select wiki from gold.dim_wikis)
+group by m.wiki
+```
+
+| wiki | first_ingested | first_event |
+|---|---|---|
+| `bewiktionary` | 2026-09-18 01:48:30 | 2026-09-18 01:48:15 |
+
+The Belarusian Wiktionary emitted its first event of this pipeline's life at 01:48:15
+and the silver stream committed it at 01:48:30 — after `dim_wikis` was built and
+before `mart_top_pages_hourly` was. Three edits to three pages, so three top-ten rows,
+pointing at a wiki the dimension had never seen.
+
+This is the shape of bug that a repository built on a *bounded* dataset never
+produces, and it is worth stating plainly because it is the whole reason a streaming
+project is a different discipline: **the input changed while the DAG was running.**
+Spark commits a snapshot to `silver.edits` every 30 seconds. A full `dbt build` takes
+72 seconds here and runs models on four threads. `dim_wikis` and the four marts have
+no dependency on each other — they all depend only on `stg_edits` — so dbt is free to
+build them concurrently, each against whatever snapshot Trino resolves at its own
+`select`. dbt gives a run one transaction per model. Nothing in dbt, Trino or Iceberg
+gives a run one *view of the world*.
+
+A test that compares two models is the only thing that notices. That is not a reason
+to weaken the test; it is the test doing its job, and the reason to keep it is that
+the same divergence is invisible in every dashboard built on those two tables.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| One cutoff per run, `where ingested_at < run_started_at` | Chosen. |
+| `severity: warn` on the relationships tests | The fastest fix and the worst one. It converts a real inconsistency between two published tables into a line of yellow text that everybody learns to scroll past, and it would still be there when the inconsistency had a different cause. |
+| Iceberg time travel — pin the staging views with `for timestamp as of` | Says the same thing more directly and breaks something else. `stg_edits` and `stg_quarantine` are views, so the pin would be baked into the view definition and an ad-hoc `select * from gold.stg_edits` would return whatever was current at the last dbt run until the next one. The gold layer is allowed to be as-of; a staging view over a live table is not. |
+| Build `dim_wikis` first and force the marts to depend on it | Reverses the race rather than removing it: the marts then read a *later* snapshot than the dimension by construction, which is exactly the failing direction. Serialising the graph would also cost the four-thread build for no correctness gain. |
+| Derive `dim_wikis` from the union of the marts | Makes the dimension a summary of its own consumers, so a wiki that appears in no mart's top ten drops out of the dimension entirely. That is a worse table for the sake of a green test. |
+| Accept it and retry the failing run | It fails whenever a new wiki, or a new domain for a known wiki, first appears mid-run. On this source that is often enough to be noise and rare enough to look random, which is the worst frequency a flaky test can have. |
+
+### Decision
+
+`dbt/macros/run_cutoff.sql` renders `run_started_at` — one value per dbt invocation,
+identical in every model and every test of that run — as a zoned Trino literal. Every
+model that reads a staging view adds `and <alias>.ingested_at < {{ run_cutoff() }}`;
+`mart_pipeline_health` adds it twice, because it reads both staging views and the
+quarantine's ingest clock is called `failed_at`. Snapshot isolation expressed as a
+predicate, which is what a lakehouse offers in place of a transaction spanning five
+tables.
+
+Three details carry the correctness:
+
+1. **The bound is on ingest time, not event time.** A late event has an old
+   `event_time` and a new `ingested_at`. Bounding on event time would still admit a
+   row that arrived mid-run into a model built after one that had already read past
+   it, so the set would not be closed — and lateness is the one property of this
+   source the whole pipeline is built around.
+2. **Nothing is dropped.** Every incremental mart recomputes its boundary bucket with
+   `>=` rather than `>` (ADR-0028), so rows excluded by one run's cutoff are picked up
+   by the next. The cost is at most one run of latency on the newest bucket, not data.
+3. **`dim_wikis` publishes the cutoff it was built to**, as a `built_through` column.
+   `dbt test` on its own is a *separate invocation* with a later `run_started_at`, so
+   the singular test that recomputes the dimension from `stg_edits` reads its bound
+   off the row under test rather than from its own run. Without that, the same race
+   reappears one level up and only on the runs where `dbt test` is called alone —
+   which is how it would have reached CI.
+
+`tests/unit/test_dbt_run_cutoff.py` is a static read of the model SQL: five models
+must call the macro, six predicates must compare against an ingest-time column, and
+the singular test must not use `run_cutoff()`. Static because the failure it guards is
+not reproducible on demand — it needs a wiki to be born at the right second — and a
+test that can only fail by luck protects nothing. `.sqlfluff` restates the macro the
+way it already restates `epoch_utc`, with an arbitrary value and the same shape.
+
+### Consequence
+
+`make dbt-build` is green twice in a row against a live stream, and `make dbt-test`
+alone is green, which is the invocation that would have flaked. The gold layer is now
+explicitly *as of* a timestamp rather than implicitly as of whenever each model
+happened to run, and `dim_wikis.built_through` publishes that timestamp so a consumer
+can tell staleness from absence.
+
+The honest cost: the newest bucket in every mart lags the newest row in silver by up
+to one run. `mart_pipeline_health` gained something from that — two runs minutes apart
+now agree on the percentiles for the current hour, where before they disagreed and
+neither was wrong — and `dbt source freshness` still measures silver, not gold, so the
+freshness signal is unaffected.
+
+What this does not fix: two *separate* dbt invocations still see different cutoffs, so
+a mart built at 01:48 and another built at 01:52 do not agree. Nothing here is a
+distributed transaction. The claim is narrower and worth stating exactly: within one
+dbt run, every model reads the same set of events.

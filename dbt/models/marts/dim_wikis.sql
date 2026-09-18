@@ -39,7 +39,11 @@ with by_wiki_domain as (
         sum(coalesce(greatest(bytes_delta, 0), 0)) as bytes_added,
         sum(coalesce(least(bytes_delta, 0), 0)) as bytes_removed
     from {{ ref('stg_edits') }}
-    where not is_canary
+    where
+        not is_canary
+        -- One cutoff for the whole dbt run, so this dimension and the marts that
+        -- reference it are derived from the same rows. See macros/run_cutoff.sql.
+        and ingested_at < {{ run_cutoff() }}
     group by wiki, domain
 ),
 
@@ -63,6 +67,11 @@ rolled_up as (
 
 select
     wiki,
+    -- The cutoff this row was built to, carried as data. It is what lets
+    -- `assert_dim_wikis_primary_domain_was_observed` recompute the yardstick over
+    -- exactly the rows this model saw, in a later invocation with a later
+    -- `run_started_at` of its own.
+    {{ run_cutoff() }} as built_through,
     primary_domain,
     domain_count,
     first_seen_at,
