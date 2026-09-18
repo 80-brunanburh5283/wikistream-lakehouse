@@ -329,6 +329,27 @@ make sql SQL="SELECT count(*) AS n FROM lakehouse.silver.edits
 |445395|
 ```
 
+One count proves nothing on its own — it has to differ from the present. Both numbers
+in one statement, on a later run of the same table:
+
+```bash
+make sql SQL="SELECT 'current' AS snapshot, count(*) AS rows FROM lakehouse.silver.edits
+              UNION ALL
+              SELECT 'oldest retained', count(*) FROM lakehouse.silver.edits
+              VERSION AS OF 7674839218057691856
+              ORDER BY rows DESC"
+```
+
+```
+|snapshot       |rows  |
+|current        |222410|
+|oldest retained|791   |
+```
+
+Measured 2026-09-18 at 03:47 UTC. The 791 is not a round number for a reason: it is
+this table's first commit — one micro-batch, `added-records` 791 and `total-records`
+791 — still addressable 218 snapshots and 222,410 rows later.
+
 `FOR TIMESTAMP AS OF '2026-09-17 13:00:00'` addresses the same snapshot by wall-clock
 time, and fails with `Cannot find a snapshot older than ...` for any timestamp before
 the oldest retained snapshot — which is the honest behaviour, and the reason the floor

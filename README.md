@@ -86,7 +86,7 @@ needed, and the only credential in the repository is MinIO's documented default.
 | Docker Engine with Compose v2 | Every service is a container. |
 | 10 GB of RAM available to Docker | Measured peak across the full stack is 6,974 MiB. `make bootstrap` warns between 6 and 10 GB and fails below 6. |
 | 20 GB free on the Docker root | Nine images — four built here (4.63 GB by `docker images`) and five pulled. Summing unique layers from `docker system df -v` and counting each shared base once puts the real footprint near 8.6 GB, and Docker's build cache is a few GB on top. Kafka then adds 1.40 GB per day of retention. `make bootstrap` checks for 20. |
-| Free ports 3000, 4040, 8080, 8181, 9000, 9001, 9092 | Overridable in `.env` — every port is a variable. |
+| Free ports 3000, 4040, 8080, 8181, 9000, 9001, 9092 | One per service — [what answers on each](#operations). Every one is a variable in `.env`. |
 | An outbound HTTPS connection | The source is a live public stream. |
 
 ```bash
@@ -217,6 +217,20 @@ semantics are what make the small-file problem and the request-cost arithmetic i
 commits to — no copy, no sync job, no export — which is the interoperability claim
 that `make query` (Trino) and `make query-duckdb` (DuckDB, a third engine with no
 JVM and no configuration in this repository) exist to check from two runtimes.
+Asked the same question on 2026-09-18 at 03:37 UTC, with both streaming jobs stopped
+so the answer could not move between engines:
+
+| Engine | `count(*)` on `silver.edits` | Asked with |
+|---|---|---|
+| Spark 4.0.4 — the process that wrote the table | 222,410 | `make sql SQL="…"` |
+| Trino 483 | 222,410 | `make query` |
+| DuckDB 1.5.5, in this repository's Python process | 222,410 | `make query-duckdb` |
+
+One copy of the bytes in MinIO, three readers, nothing exported in between.
+`test_duckdb_reads_the_same_tables_and_agrees_on_the_counts` in
+[tests/integration/test_silver_rebuild.py](tests/integration/test_silver_rebuild.py)
+asserts that equality on the fixture-fed tables, so it is a test rather than a
+number that was true once.
 
 **dbt** owns the analytics layer: two staging views over silver, then four marts
 and one dimension in `gold`, with 62 tests. Each mart chooses its incremental
@@ -448,6 +462,20 @@ The everyday commands:
 | Are there too many small files? | `make maintain` — compacts, expires snapshots, rewrites manifests, removes orphans |
 | Did the marts build? | `make dbt-build` |
 | What is upstream doing right now? | `make measure-lag` |
+
+Every port the stack publishes, and what is listening on it. All seven are
+variables in `.env.example`, so a collision with something already running is a
+one-line edit rather than a reason the stack will not start:
+
+| Port | `.env` variable | What answers on it |
+|---|---|---|
+| 3000 | `WS_DAGSTER_PORT` | The Dagster UI: asset graph, check results, run history |
+| 4040 | `WS_SPARK_UI_PORT` | The Spark UI of whichever streaming job is running — batch duration and rows per trigger |
+| 8080 | `WS_TRINO_PORT` | Trino, both its web UI and the HTTP endpoint dbt and `make query` speak to |
+| 8181 | `WS_ICEBERG_REST_PORT` | The Iceberg REST catalog. Every engine resolves table metadata through it |
+| 9000 | `WS_MINIO_S3_PORT` | MinIO's S3 API — where the Parquet and the manifests actually live |
+| 9001 | `WS_MINIO_CONSOLE_PORT` | The MinIO console, for looking at the objects one commit produced |
+| 9092 | `WS_KAFKA_PORT` | Kafka. The only port the producer and both Spark jobs need |
 
 Two operational facts worth knowing before you run it for a day. **The Dagster
 schedules ship stopped** — observe every 2 minutes, marts every 15, gold
