@@ -36,6 +36,19 @@ FROM spark:4.0.4-scala2.13-java17-python3-ubuntu@sha256:8fc690e18426aa04ae92e770
 # Spark's own unprivileged uid before the end.
 USER root
 
+# Bumping Spark here is five edits, not one, and the ceiling is not Spark's release
+# schedule but Iceberg's: it publishes one runtime per Spark *minor* version, and the
+# `-4.0_` further down is part of an artifact name rather than a variable. What exists:
+#
+#   curl -sS 'https://search.maven.org/solrsearch/select?q=g:org.apache.iceberg+AND+a:iceberg-spark-runtime*&rows=50&wt=json' \
+#     | jq -r '.response.docs[].a'
+#
+# The five are the FROM tag, its digest, SPARK_VERSION, the `-4.0_` coordinate, and the
+# sha256 of each jar whose URL interpolates SPARK_VERSION. The `pyspark` pin in
+# pyproject.toml is a sixth in another ecosystem, because the driver has to match the
+# cluster. A bump that changes only the FROM line builds a new Spark with the old jars
+# inside it and fails in the analyzer, which is what Dependabot's Spark 4.2 pull request
+# did — see ADR-0052 and the ignore rules in .github/dependabot.yml.
 ARG ICEBERG_VERSION=1.10.1
 ARG SPARK_VERSION=4.0.4
 ARG SCALA_BINARY=2.13

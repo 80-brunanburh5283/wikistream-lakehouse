@@ -97,6 +97,21 @@ information about the world rather than a verdict on your change. If you touch t
 streaming path, run `make test-e2e` yourself and say so in the pull request — it
 takes four minutes and it is the only check that proves the restart guarantee.
 
+## Dependency versions
+
+Dependabot runs weekly and its patch bumps are ordinary pull requests. Three pins are on
+its ignore list for minor and major bumps, and if you want to move one of those, it is a
+deliberate change rather than a version bump:
+
+| Pin | Why it is coupled |
+|---|---|
+| `spark` image, `pyspark` | The Spark minor version appears in five places in `docker/spark.Dockerfile` — tag, digest, `SPARK_VERSION`, the `iceberg-spark-runtime-4.0_2.13` coordinate, and each jar's `sha256` — plus the `pyspark` pin, because the driver must match the cluster. The real ceiling is Iceberg, which publishes one runtime per Spark minor. |
+| `python` image | `requires-python = ">=3.12,<3.13"`, and the version is also fixed in `.python-version`, `.pre-commit-config.yaml` and both workflows. |
+
+The comment above the `ARG` block in `docker/spark.Dockerfile` has the query that says
+which Spark minors Iceberg supports today. `make test-integration` is the gate for any of
+this; the reasoning is [ADR-0052](DECISIONS.md).
+
 ## Commit messages
 
 [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/). The
