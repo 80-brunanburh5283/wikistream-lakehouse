@@ -173,21 +173,37 @@ measure-resources: ## Peak memory per container, sampled for 5 minutes. Needs th
 init-tables: ## Create namespaces and the bronze/silver Iceberg tables (idempotent)
 	$(SPARK_SUBMIT) /opt/wikistream/scripts/init_tables.py
 
+# The four streaming targets go through scripts/stream.sh rather than calling
+# spark-submit directly, and that script's header says why: `docker exec` does not
+# forward signals, so a Ctrl-C here would otherwise leave the job running inside the
+# container. Everything else in this file is a compose command in plain sight.
 .PHONY: stream-bronze
-stream-bronze: ## Run the bronze append stream continuously
-	$(SPARK_SUBMIT) --name bronze /opt/wikistream/src/wikistream/streaming/bronze.py
+stream-bronze: ## Run the bronze append stream continuously (Ctrl-C stops it)
+	@COMPOSE="$(COMPOSE)" bash scripts/stream.sh bronze
 
 .PHONY: stream-bronze-once
 stream-bronze-once: ## Run one bronze micro-batch over all available data, then exit
-	$(SPARK_SUBMIT) --name bronze-once /opt/wikistream/src/wikistream/streaming/bronze.py --once
+	@COMPOSE="$(COMPOSE)" bash scripts/stream.sh bronze --once
 
 .PHONY: stream-silver
-stream-silver: ## Run the silver MERGE stream continuously
-	$(SPARK_SUBMIT) --name silver /opt/wikistream/src/wikistream/streaming/silver.py
+stream-silver: ## Run the silver MERGE stream continuously (Ctrl-C stops it)
+	@COMPOSE="$(COMPOSE)" bash scripts/stream.sh silver
 
 .PHONY: stream-silver-once
 stream-silver-once: ## Run one silver micro-batch over all available data, then exit
-	$(SPARK_SUBMIT) --name silver-once /opt/wikistream/src/wikistream/streaming/silver.py --once
+	@COMPOSE="$(COMPOSE)" bash scripts/stream.sh silver --once
+
+# For the stream you started in a terminal you have since closed. Deliberately
+# narrow: it matches the driver's app name, so a `make sql`, a maintenance run or an
+# integration test's spark-submit in the same container is not collateral damage.
+.PHONY: stop-streams
+stop-streams: ## Stop any bronze or silver job still running in the Spark container
+	@$(COMPOSE) exec -T spark bash -lc \
+	  'set -o pipefail; pgrep -af "SparkSubmit --name (bronze|silver)" \
+	     | sed -E "s/.*--name ([^ ]+).*/stopping \1/" \
+	     || echo "no streaming job is running"'
+	@$(COMPOSE) exec -T spark bash -lc \
+	  'pkill -TERM -f "SparkSubmit --name (bronze|silver)" || true'
 
 .PHONY: rebuild-silver
 rebuild-silver: ## Rebuild silver from bronze for a date range: FROM=YYYY-MM-DD TO=YYYY-MM-DD

@@ -2600,3 +2600,61 @@ One more required check, five minutes of free-tier runner per push, and no new
 dependency for a contributor. The gap it leaves is that a workflow edit made without
 pushing is unchecked locally — accepted, because pushing is the only way to run a
 workflow anyway.
+
+## ADR-0050 — Wrap the streaming targets in a script so Ctrl-C reaches the driver
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+`make stream-bronze` submitted the job with `docker compose exec -T spark spark-submit`,
+which is how every other stack target in the Makefile is written and is deliberate: what
+the README shows is literally what runs.
+
+For a long-running foreground process it is wrong. `docker exec` does not forward signals
+to the process it starts, and `-T` removes the TTY, so the terminal's own Ctrl-C has no
+path down either. Measured on 2026-09-18: pressing Ctrl-C returned the shell prompt and
+left the `SparkSubmit` JVM and its `bronze.py` running inside the container fifteen
+seconds later — still committing to Iceberg, with its stdout attached to a client that no
+longer existed, and nothing about it in `docker compose logs spark`. The next
+`make stream-bronze` failed with `Multiple streaming queries are concurrently using
+/opt/spark/checkpoints/...` naming a query the operator had no way to see.
+
+Nothing was corrupted by this. The checkpoint protocol survives a SIGKILL —
+`tests/e2e/test_restart_idempotency.py` is the proof — so the orphan's committed batches
+were valid and the invisible stream was, technically, working. That is what made it worth
+fixing rather than documenting: a fault that leaves no damage and no log line is one an
+operator diagnoses by watching row counts move on a stopped pipeline.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| `scripts/stream.sh`: submit in the background, trap `INT`/`TERM`, `pkill -TERM` the driver by app name over a second exec | Chosen. Costs one file and one indirection on four of the 62 targets; the rest stay plain compose commands. |
+| Drop `-T` from `SPARK_SUBMIT` so the TTY carries the signal | Breaks every non-interactive caller of the same variable — CI, `make sql`, the acceptance script, `make maintain` — with `the input device is not a TTY`. A fix for the interactive case that breaks the automated one. |
+| `docker compose run` instead of `exec`, which does propagate signals | A second Spark container per stream, each with its own driver heap, on a box where the measured peak is already 6.9 GiB. It would also bypass the healthchecked long-lived container the other targets share. |
+| Ship `make stop-streams` alone and document Ctrl-C as a known wart | Rejected on the grounds in hard rule 6 of this project's own brief: an operator's first instinct is the correct one, and a stack where Ctrl-C silently does not stop the thing you are looking at is a defect, not a footnote. |
+| Run the streams as compose services with `restart: unless-stopped` | The right answer for a deployment and the wrong one for a demo. `docker compose stop` would then be the stop command, but the reviewer following the README loses the streaming log on their terminal, which is the most legible thing in the whole quickstart. |
+
+### Decision
+
+Four targets call `scripts/stream.sh <layer> [--once]`. The script names the Spark
+application `<layer>-<shell pid>` so its trap stops the run it started and not a stream in
+another terminal, backgrounds the submit and `wait`s (bash runs a trap only between
+commands, so a foreground submit would defer the handler until the JVM had already
+exited), and re-`wait`s until the driver is reaped rather than exiting mid-shutdown.
+
+`make stop-streams` covers what a trap cannot: a closed terminal, a `kill -9`, or a
+`docker compose exec` typed by hand. It matches `SparkSubmit --name (bronze|silver)`, so
+an interactive `make sql`, a maintenance run or an integration test's own submit in the
+same container is not collateral damage — the tests name their applications
+`e2e-restart-<run id>`. It prints what it found before it signals anything.
+
+### Consequence
+
+The Makefile's "every target is a compose command in plain sight" property now has one
+documented exception, with the reason in the script's header and in the comment above the
+targets. A graceful stop leaves a complete batch in the checkpoint, which is why
+`make stream-bronze-once` works immediately afterwards — measured resuming at batch 218
+with zero offsets behind — where after a crash it hits the concurrent-query error and
+`make stream-bronze` is the documented recovery. Runbook entry 12 covers the orphan case.

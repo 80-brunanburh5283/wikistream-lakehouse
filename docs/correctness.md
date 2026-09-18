@@ -215,6 +215,17 @@ This is asserted, not merely written down:
 `test_once_cannot_resume_an_unconfirmed_batch` fails if Spark ever fixes the
 `AvailableNow` path, which is the signal to delete both the test and this section.
 
+A *graceful* stop is the other case and behaves the opposite way. Ctrl-C on
+`make stream-silver` runs Spark's shutdown hook, which finishes the batch in flight and
+commits it, so the newest checkpoint entry is complete and `--once` resumes from it
+without the error above — measured 2026-09-18 on the bronze stream, which came back at
+batch 218 with zero offsets behind. Whether the checkpoint's last batch is confirmed is
+what separates the two, not whether a process died. `scripts/stream.sh` exists so that
+Ctrl-C reaches the driver at all inside the container
+([ADR-0050](../DECISIONS.md#adr-0050--wrap-the-streaming-targets-in-a-script-so-ctrl-c-reaches-the-driver));
+[runbook entry 12](runbook.md#12-a-stream-is-still-running-after-you-stopped-it) covers
+the case where it did not.
+
 ## 3. Late-arriving events are stored, not dropped
 
 The silver stream declares no watermark. That is a decision with a measurement behind

@@ -87,6 +87,7 @@ thing on stdout.
 | `ICEBERG_CATALOG_ERROR` or `ICEBERG_COMMIT_ERROR` with no cause | [9](#9-a-catalog-error-whose-cause-is-three-layers-down) |
 | a mart's numbers are wrong after a model change | [10](#10-a-marts-grain-or-a-column-changed) |
 | Trino query killed; `wikistream-trino` restarts | [11](#11-trino-runs-out-of-memory) |
+| rows keep arriving with no stream running, or `commits` is in use by a query you cannot see | [12](#12-a-stream-is-still-running-after-you-stopped-it) |
 
 ## 1. The source is unreachable
 
@@ -614,6 +615,47 @@ rather than simultaneous, so the sum is an upper bound, not a reading.
 Compaction helps here too, for a reason worth naming: a query against 825 small files
 spends memory on planning that a query against a few large ones does not.
 `make maintain` is the fix for a slow query as often as for a full disk.
+
+## 12. A stream is still running after you stopped it
+
+**Symptom.** You closed the terminal that was running `make stream-silver`, or pressed
+Ctrl-C in it, and the table keeps gaining rows. Or the next `make stream-silver` fails
+with `Multiple streaming queries are concurrently using
+/opt/spark/checkpoints/silver_edits/commits`, naming a concurrent query you cannot see.
+
+**Cause.** The job runs inside the `spark` container, submitted over `docker compose
+exec`. `docker exec` does not forward signals to the process it started, so before this
+was fixed a Ctrl-C killed the local client and left the driver running with its output
+going nowhere. `scripts/stream.sh` now traps `INT` and `TERM` and sends the signal over
+a second exec, so the ordinary case is handled — but a `kill -9` on the client, a closed
+laptop lid, or a `docker compose exec` you typed yourself still leaves the same orphan.
+
+**Diagnose.**
+
+```bash
+make stop-streams   # lists what is running before it stops anything
+```
+
+**Fix.** The same target. It matches the driver's Spark app name, so a `make sql`, a
+maintenance run or an integration test in the same container is not collateral damage:
+
+```
+$ make stop-streams
+stopping silver-223486
+```
+
+Then restart the stream and check the invariant:
+
+```bash
+make stream-silver
+make verify-no-duplicates
+```
+
+There is nothing to repair. An orphaned stream is a stream that was working — it
+committed complete micro-batches the whole time it was invisible, and killing it costs
+at most the batch in flight, which the next run replays from the checkpoint. Measured
+2026-09-18: after a `make stop-streams`, `make stream-bronze-once` resumed at batch 218
+with `max_offsets_behind 0`, and the five duplicate checks passed on 224,683 silver rows.
 
 ## What this runbook does not cover
 

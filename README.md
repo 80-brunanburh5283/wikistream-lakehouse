@@ -446,10 +446,13 @@ refuses to stage a private key.
 
 ## Operations
 
-[docs/runbook.md](docs/runbook.md) is the real answer: seven failure modes —
+[docs/runbook.md](docs/runbook.md) is the real answer: twelve failure modes —
 source unreachable, broker down, object store full, poison message, upstream
-schema change, corrupted checkpoint, backfill a window — each with the symptom,
-the command that diagnoses it, and the fix.
+schema change, corrupted checkpoint, backfill a window, bronze growing without
+bound, an opaque catalog error, a changed mart grain, Trino out of memory, an
+orphaned stream — each with the symptom, the command that diagnoses it, and the
+fix. It opens with a symptom index, because at 3 a.m. you know what you are
+seeing, not what it is called.
 
 The everyday commands:
 
@@ -462,6 +465,7 @@ The everyday commands:
 | Are there too many small files? | `make maintain` — compacts, expires snapshots, rewrites manifests, removes orphans |
 | Did the marts build? | `make dbt-build` |
 | What is upstream doing right now? | `make measure-lag` |
+| Is a stream still running from a terminal I closed? | `make stop-streams` — lists what it finds before it stops it |
 
 Every port the stack publishes, and what is listening on it. All seven are
 variables in `.env.example`, so a collision with something already running is a
