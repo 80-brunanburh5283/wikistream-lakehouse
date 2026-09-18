@@ -1251,19 +1251,26 @@ they are working, and then deletes the newest commit file. Deleting `commits/N`
 puts the checkpoint in exactly the state an interrupted commit leaves it in —
 `offsets/N` present, `commits/N` absent — so the replay is guaranteed rather than
 hoped for. The test prints how many Kafka records the replayed batch covered, which
-is the number that makes the result meaningful: 858 on the run recorded in
-`docs/correctness.md`.
+is the number that makes the result meaningful. That number is not quoted here: the
+topic is fed from a live firehose, so it differs on every run, and the transcript in
+`docs/correctness.md` carries whichever one produced it.
 
 The sharpest assertion is the second replay. With the producer stopped and the
-topic static, re-running a committed batch of 2,640 records must move the row count
-by exactly zero — an equality, not a bound.
+topic static, re-running an already-committed batch must move the row count by exactly
+zero — an equality, not a bound.
 
 ### Consequence
 
-The proof is deterministic, and the two halves of it are honest about what each
+The replay is deterministic, and the two halves of the proof are honest about what each
 one does: SIGKILL demonstrates that a hard kill cannot half-write an Iceberg
 commit, and the file deletion demonstrates that a genuine re-read of already-merged
 offsets inserts nothing. Neither claims to be the other.
+
+What the deletion does not make deterministic is *how many* batches are left unconfirmed,
+and one assertion turned out to depend on that. See
+[ADR-0051](#adr-0051--assert-the-invariant-a-flaky-characterisation-test-was-standing-in-for),
+which is the correction and not a revision of this record — every duplicate-suppression
+assertion above held in both shapes.
 
 The cost is that the test reaches into Spark's checkpoint layout, which is internal.
 If Spark renames those directories the test breaks — loudly, at the `rm`, not
