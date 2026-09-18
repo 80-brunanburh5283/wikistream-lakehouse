@@ -2553,3 +2553,50 @@ core profile's measured peak is 4,561 MiB of the 16 GB `ubuntu-latest` has.
 GitHub also disables scheduled workflows in a public repository after 60 days without
 activity. That is the right behaviour here rather than a problem to work around — a
 dormant repository should stop asking Wikimedia for data.
+
+---
+
+## ADR-0049 — Lint the workflows with actionlint in CI, not through a make target
+
+**Date:** 2026-09-18 · **Status:** accepted
+
+### Context
+
+There are now three workflow files and about 400 lines of YAML in `.github/workflows/`,
+and until this entry nothing in the repository read them. `ruff` and `mypy` do not
+parse YAML; pre-commit's `check-yaml` proves a file is well-formed, not that a step
+refers to an output some earlier step actually declares. So a typo in an `if:`
+expression, an action pinned to a tag that does not exist, or a shell mistake inside a
+`run:` block was discoverable only by running the workflow and watching it fail.
+
+That is tolerable for `ci.yml`, which runs on every push. It is a bad deal for
+`nightly.yml` ([ADR-0048](#adr-0048--run-the-restart-proof-on-a-nightly-schedule-not-on-every-pull-request)),
+which by design nobody runs before it runs itself.
+
+### Options
+
+| Option | Rejected because |
+|---|---|
+| A `workflows` job in `ci.yml` that downloads the pinned actionlint release | Chosen. Same shape as the `secrets` job, which pins and downloads gitleaks for the same reason. |
+| A `make lint-actions` target, so local matches CI | The property this repository otherwise keeps, and the one place it does not fit: actionlint is a Go binary, so `make lint` would start failing for every contributor who does not have it. The files it checks are only ever executed by GitHub, so unlike every other lint here there is nothing to catch on a laptop that CI would miss. |
+| The `rhysd/actionlint` pre-commit hook | Its default hook needs a Go toolchain to build the binary; the alternative runs it in Docker, which is slow enough on a pre-commit hook to be bypassed. |
+| `reviewdog/action-actionlint` | A third-party action with more permissions than this needs — it posts review comments — for a check whose output is three lines of stderr. |
+
+### Decision
+
+A five-minute `workflows` job pinned to actionlint 1.7.12, downloaded from the GitHub
+release the same way `secrets` downloads gitleaks.
+
+The half of actionlint that earns its place is that it shells out to `shellcheck` for
+every `run:` block, and `ubuntu-latest` has shellcheck where a laptop may not. Running
+it locally with shellcheck installed found one finding on the existing workflows —
+SC2016 on the backticks inside a single-quoted markdown heading, which is a false
+positive and is now suppressed inline with the reason next to it rather than by
+loosening the rule set.
+
+### Consequence
+
+One more required check, five minutes of free-tier runner per push, and no new
+dependency for a contributor. The gap it leaves is that a workflow edit made without
+pushing is unchecked locally — accepted, because pushing is the only way to run a
+workflow anyway.

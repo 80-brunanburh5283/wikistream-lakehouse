@@ -409,7 +409,8 @@ anywhere in any of them:
 
 - `ci.yml` — `lint` (ruff, mypy, sqlfluff, `dbt parse`, and a link check that
   resolves every relative link and heading anchor in the Markdown, including the
-  19 ADR anchors this file points at), `unit` with a coverage artefact, `spark`,
+  19 ADR anchors this file points at), `workflow lint` (actionlint, which also
+  shellchecks every `run:` block), `unit` with a coverage artefact, `spark`,
   `integration` (sharded, against a real core stack brought up in the runner), and
   `secrets` (gitleaks). Superseded runs are cancelled by a concurrency group;
   every job has a timeout.

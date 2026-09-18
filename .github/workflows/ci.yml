@@ -74,6 +74,33 @@ jobs:
       # warehouse — see the target's comment.
       - run: make dbt-parse
 
+  workflows:
+    name: workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      ACTIONLINT_VERSION: "1.7.12"
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      # The only check here that reads the workflow files themselves. ruff and mypy do
+      # not read YAML, and `check-yaml` proves a file parses rather than that it means
+      # anything — so an `if:` expression with a typo, a step referring to an output no
+      # earlier step declares, or an action pinned to a tag that does not exist is
+      # otherwise found by running the workflow and watching it fail. That is a bad way
+      # to find out about nightly.yml, which by design nobody runs before it runs
+      # itself.
+      #
+      # Not a make target, unlike every other step in this file: actionlint is a Go
+      # binary, and the files it reads are only ever executed by GitHub. It also shells
+      # out to shellcheck for every `run:` block, which is the more useful half and
+      # which needs a shellcheck that `ubuntu-latest` already has and a laptop may not.
+      - name: actionlint ${{ env.ACTIONLINT_VERSION }}
+        run: |
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C /tmp actionlint
+          /tmp/actionlint -color
+
   unit:
     name: unit tests
     runs-on: ubuntu-latest
@@ -102,6 +129,7 @@ jobs:
       - name: coverage summary
         run: |
           uv run coverage report > coverage-summary.txt
+          # shellcheck disable=SC2016  # the backticks are markdown, not a subshell
           {
             echo '### Coverage — `src/wikistream`'
             echo
