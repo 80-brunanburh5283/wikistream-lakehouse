@@ -29,7 +29,7 @@ uv sync                 # creates .venv and installs everything, including dev t
 uv run pre-commit install
 
 bash scripts/bootstrap.sh   # checks your machine can run the stack
-make up                     # ~4 minutes cold
+make up                     # 2m28s cold once the images are built
 ```
 
 `make help` lists every target.
@@ -40,7 +40,7 @@ There are four levels, and they have different requirements:
 
 | Command | Needs | Roughly |
 |---|---|---|
-| `make test-unit` | nothing — no network, no Docker, no JVM | 267 tests, 16 s |
+| `make test-unit` | nothing — no network, no Docker, no JVM | 285 tests, 4 s warm |
 | `make test-spark` | a JDK, but no Docker | 75 tests, 67 s |
 | `make test-integration` | `make up-core` | 22 tests, 10 min |
 | `make test-e2e` | `make up`, plus the public internet | several minutes |
@@ -71,7 +71,7 @@ Everything else runs against captured fixtures and local containers.
 ## Before you open a pull request
 
 ```bash
-make lint         # ruff check, ruff format --check, sqlfluff
+make lint         # ruff check, ruff format --check, sqlfluff, Markdown links
 make typecheck    # mypy
 make dbt-parse    # compiles the dbt graph; no warehouse needed
 make test         # unit + Spark + integration

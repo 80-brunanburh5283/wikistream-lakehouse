@@ -244,7 +244,7 @@ it ([ADR-0002](DECISIONS.md#adr-0002--a-real-time-lakehouse-not-a-batch-elt-proj
 A live public firehose supplies real duplicates on reconnect, real out-of-order
 arrival, real schema variation between event types and real diurnal rate changes,
 at no cost. It also supplies the constraint that the hardest test needs the
-internet, which is why the suite is split by marker: 364 of the 371 tests never
+internet, which is why the suite is split by marker: 382 of the 389 tests never
 open a socket to Wikimedia, and the seven that do are the restart proof.
 
 The constraints that shaped every other decision:
@@ -259,7 +259,7 @@ The constraints that shaped every other decision:
 
 ## Design decisions
 
-Every row links to a record that names what was rejected and why. There are 46 of
+Every row links to a record that names what was rejected and why. There are 47 of
 them in [DECISIONS.md](DECISIONS.md); these are the eleven a reviewer is most likely
 to want to argue with.
 
@@ -380,17 +380,17 @@ was setting the test to `warn`.
 
 ## Testing and CI
 
-371 tests, split by marker so that each layer runs where it can:
+389 tests, split by marker so that each layer runs where it can:
 
 | Marker | Count | Needs | Runs in CI |
 |---|---|---|---|
-| `unit` | 267 | nothing — no network, no Docker, no JVM | yes |
+| `unit` | 285 | nothing — no network, no Docker, no JVM | yes |
 | `spark` | 75 | a JDK and in-process Spark | yes |
 | `integration` | 22 | `make up-core` | yes, with the core profile |
 | `e2e` | 7 | the full stack, the internet, and minutes | no — it is the restart proof, run by hand |
 
 `make test` runs the first three. The split matters because it decides what a
-contributor can check before pushing: 267 tests need nothing but Python, which is
+contributor can check before pushing: 285 tests need nothing but Python, which is
 what makes the pre-commit hook worth having.
 
 Three of the suites are less obvious than the rest and are the ones I would point
@@ -407,10 +407,12 @@ because the bug it guards is not reproducible on demand — see property 6 above
 **CI** is two GitHub Actions workflows, free tier only, no cloud credentials
 anywhere in either:
 
-- `ci.yml` — `lint` (ruff, mypy, sqlfluff, `dbt parse`), `unit` with a coverage
-  artefact, `spark`, `integration` (sharded, against a real core stack brought up
-  in the runner), and `secrets` (gitleaks). Superseded runs are cancelled by a
-  concurrency group; every job has a timeout.
+- `ci.yml` — `lint` (ruff, mypy, sqlfluff, `dbt parse`, and a link check that
+  resolves every relative link and heading anchor in the Markdown, including the
+  19 ADR anchors this file points at), `unit` with a coverage artefact, `spark`,
+  `integration` (sharded, against a real core stack brought up in the runner), and
+  `secrets` (gitleaks). Superseded runs are cancelled by a concurrency group;
+  every job has a timeout.
 - `infra.yml` — `terraform fmt -check`, `init -backend=false`, `validate`, a
   Trivy config scan, and `kubeconform --strict` over every kustomize overlay.
 
