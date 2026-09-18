@@ -116,6 +116,13 @@ jobs:
 
       - run: uv sync --locked
 
+      # Four unit modules import the Dagster definitions, which read dbt's
+      # manifest.json at import time. It is gitignored, so a fresh checkout does not
+      # have one and those modules fail to collect. Explicit here because the step
+      # below runs pytest directly rather than through the Makefile, which carries
+      # this as a prerequisite.
+      - run: make dbt-manifest
+
       # Not `make test-unit`: the same tests, plus coverage. The marker is what
       # keeps this job honest about its dependencies — a `unit` test that reaches
       # the network or Docker would pass here and be wrongly marked.

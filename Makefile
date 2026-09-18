@@ -37,6 +37,15 @@ PRODUCER_EVENTS  ?= 2000
 # own keep-going flag, and `make test -- -k bronze` looks for a target named `-k`.
 PYTEST_ARGS ?=
 
+# dagster-dbt reads this file when `wikistream_dagster.definitions` is imported, so the
+# four test modules that import it cannot even be *collected* without it. It is a build
+# artefact, gitignored, and therefore absent from a fresh clone — which is how a green
+# `make test` here went red in CI on the first push. A file prerequisite rather than a
+# phony one so it is parsed once and then only when a model or schema file is newer.
+DBT_MANIFEST := dbt/target/manifest.json
+DBT_SOURCES  := $(shell find dbt -type f \( -name '*.sql' -o -name '*.yml' \) \
+                  -not -path 'dbt/target/*' 2>/dev/null)
+
 # Sampling window for the source-lag measurement. Not named SECONDS: that is a
 # bash builtin holding the shell's own uptime, and a recipe reading it gets 0.
 LAG_SECONDS ?= 120
@@ -337,20 +346,35 @@ dbt-parse: ## Compile the dbt graph without a warehouse. The SQL half of `make l
 	  --target-path /tmp/wikistream-dbt-parse \
 	  --no-use-colors
 
+$(DBT_MANIFEST): $(DBT_SOURCES)
+	@# Into the project's own target/ this time, not /tmp: the Dagster code expects
+	@# `manifest.json` where dbt's default target path puts it, and this is the only
+	@# target that produces an artefact the rest of the repo reads. `parse` and not
+	@# `compile`, so no warehouse is needed — see `dbt-parse` for why the profile
+	@# resolves with nothing configured.
+	$(UV) run dbt parse \
+	  --project-dir dbt \
+	  --profiles-dir dbt \
+	  --target-path $(CURDIR)/dbt/target \
+	  --no-use-colors
+
+.PHONY: dbt-manifest
+dbt-manifest: $(DBT_MANIFEST) ## Parse the dbt graph into dbt/target/, which the tests import
+
 .PHONY: test
-test: ## Unit + Spark + integration tests
+test: $(DBT_MANIFEST) ## Unit + Spark + integration tests
 	$(UV) run pytest -m "unit or spark or integration" $(PYTEST_ARGS)
 
 .PHONY: test-unit
-test-unit: ## Unit tests only. No network, no Docker, no JVM.
+test-unit: $(DBT_MANIFEST) ## Unit tests only. No network, no Docker, no JVM.
 	$(UV) run pytest -m unit $(PYTEST_ARGS)
 
 .PHONY: test-spark
-test-spark: ## Schema tests against a real in-process Spark. Needs a JDK, not Docker.
+test-spark: $(DBT_MANIFEST) ## Schema tests against a real in-process Spark. Needs a JDK, not Docker.
 	$(UV) run pytest -m spark $(PYTEST_ARGS)
 
 .PHONY: test-integration
-test-integration: ## Integration tests. Needs `make up-core`. PYTEST_ARGS="-k bronze" to narrow.
+test-integration: $(DBT_MANIFEST) ## Integration tests. Needs `make up-core`. PYTEST_ARGS="-k bronze" to narrow.
 	$(UV) run pytest -m integration $(PYTEST_ARGS)
 
 .PHONY: test-e2e

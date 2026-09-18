@@ -46,7 +46,11 @@ There are four levels, and they have different requirements:
 | `make test-e2e` | `make up-core`, plus the public internet | 7 tests, 4 min |
 
 Those four figures were measured on one machine on 2026-09-18 and are there to set
-expectations, not as a benchmark. The integration suite is slow for one reason: most
+expectations, not as a benchmark. The first run of any of them on a fresh clone is a few
+seconds slower, because four test modules import the Dagster definitions and those read
+dbt's `manifest.json` at import time. It is a gitignored build artefact, so the test
+targets parse the dbt project into `dbt/target/` first and then only again when a model
+or a schema file changes. `make dbt-manifest` does that step on its own. The integration suite is slow for one reason: most
 of its ten minutes is JVM start-up, because every assertion about a MERGE has to
 ingest to bronze with one `spark-submit` and then rebuild with another. CI runs it in
 two shards for that reason; `PYTEST_ARGS="tests/integration/test_bronze.py"` narrows
