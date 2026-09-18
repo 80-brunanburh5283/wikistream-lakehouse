@@ -41,6 +41,12 @@ PYTEST_ARGS ?=
 # bash builtin holding the shell's own uptime, and a recipe reading it gets 0.
 LAG_SECONDS ?= 120
 
+# Sampling window and interval for `make measure-resources`. Five minutes at ten
+# seconds is 30 samples, which is enough to catch a Spark micro-batch and a Trino
+# query; each sample costs one `docker stats` call per container.
+SAMPLE_SECONDS  ?= 300
+SAMPLE_INTERVAL ?= 10
+
 # Extra arguments for `make maintain`, e.g. MAINTAIN_ARGS="--snapshot-age-hours 0" to
 # show expiry doing something without waiting a week for the age threshold to pass.
 # The figures in docs/lakehouse.md come from a run with exactly that argument.
@@ -135,9 +141,11 @@ kafka-lag: ## Print consumer group lag for the streaming jobs
 
 # -------------------------------------------------------------- measurement
 #
-# Every number in docs/ comes from one of these four targets. They are here so a
-# reader can regenerate a figure rather than take it on trust, and so a figure that
-# has gone stale can be spotted by rerunning it.
+# The measurement targets. Every throughput, latency, partition-balance and memory
+# figure in docs/ comes from one of these; the table and file figures come from
+# `make table-stats` and `make maintain`. They are here so a reader can regenerate a
+# number rather than take it on trust, and so one that has gone stale can be spotted
+# by rerunning it.
 
 .PHONY: measure-throughput
 measure-throughput: ## Ingest rate, compression ratio and partition balance. Needs `make up-core`.
@@ -154,6 +162,10 @@ measure-lag: ## Source lag distribution, which is where the watermark comes from
 .PHONY: explain-partitions
 explain-partitions: ## Why one Kafka partition takes most of the traffic. No network.
 	$(UV) run python scripts/analyse_partitioning.py
+
+.PHONY: measure-resources
+measure-resources: ## Peak memory per container, sampled for 5 minutes. Needs the stack up.
+	@bash scripts/measure_resources.sh $(SAMPLE_SECONDS) $(SAMPLE_INTERVAL)
 
 # ---------------------------------------------------------------- lakehouse
 
