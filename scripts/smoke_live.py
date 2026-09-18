@@ -157,7 +157,24 @@ def main(argv: list[str] | None = None) -> int:
         print("\n1 check failed.\n")
         return 1
     report.ok("reachable", f"{len(raws)} frames in {elapsed:.1f}s ({len(raws) / elapsed:.1f}/s)")
+    check_frames(raws, decoded, report)
 
+    print()
+    if report.failures:
+        print(f"{report.failures} check(s) failed.\n")
+        return 1
+    if report.warnings:
+        print(f"all checks passed with {report.warnings} warning(s).\n")
+    else:
+        print("all checks passed.\n")
+    return 0
+
+
+def check_frames(raws: list[str], decoded: list[dict[str, Any]], report: Report) -> None:
+    """The four checks that need frames in hand, in the order their fixes escalate.
+
+    `reachable` is decided in `main`, because everything here presumes it passed.
+    """
     malformed = len(raws) - len(decoded)
     if malformed:
         # Not fatal: one bad frame in a firehose is expected occasionally, and the
@@ -192,16 +209,6 @@ def main(argv: list[str] | None = None) -> int:
         # or negative minutes — means a clock problem worth knowing about early.
         print(f"\n  observed lag: median {statistics.median(lags):.1f}s over {len(lags)} frames")
         print("  (indicative only; the watermark comes from scripts/measure_source_lag.py)")
-
-    print()
-    if report.failures:
-        print(f"{report.failures} check(s) failed.\n")
-        return 1
-    if report.warnings:
-        print(f"all checks passed with {report.warnings} warning(s).\n")
-    else:
-        print("all checks passed.\n")
-    return 0
 
 
 if __name__ == "__main__":

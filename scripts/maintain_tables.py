@@ -13,8 +13,9 @@ they come from here rather than from a blog post.
 `remove_orphan_files` deletes files the metadata does not reference, and a file being
 written by a commit that has not landed yet fits that description. The age threshold
 (`--orphan-age-hours`, three days by default) is what makes it safe, but the honest
-instruction is to stop the writers: `make down-streams` or Ctrl-C the stream, then run
-this. The default is conservative enough that forgetting is survivable.
+instruction is to stop the writers: Ctrl-C the stream, or `make stop-streams` if you
+have lost the terminal it was running in, then run this. The default is conservative
+enough that forgetting is survivable.
 
 ## What the numbers will and will not show on a laptop
 
@@ -113,7 +114,8 @@ def maintain(
     return before, after
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parse_args(argv: list[str] | None) -> argparse.Namespace:
+    """The two age thresholds are the only dangerous knobs here, so they carry help."""
     parser = argparse.ArgumentParser(description="Run Iceberg maintenance on every table.")
     parser.add_argument(
         "--orphan-age-hours",
@@ -136,8 +138,58 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Override the table's compaction target. Only useful at test volumes.",
     )
-    args = parser.parse_args(argv)
+    return parser.parse_args(argv)
 
+
+def maintain_all(
+    spark: SparkSession,
+    tables: tuple[str, ...],
+    *,
+    orphan_cutoff: datetime,
+    snapshot_cutoff: datetime,
+    target_bytes: int | None,
+) -> int:
+    """Maintain every table in order and return the process exit code.
+
+    Separate from `main` because this is where the pass/fail judgement lives: the row
+    count before and after must match on every table. A procedure that quietly deleted
+    live data would otherwise look like a successful run with a smaller number in it.
+    """
+    for table in tables:
+        before, after = maintain(
+            spark,
+            table,
+            orphan_cutoff=orphan_cutoff,
+            snapshot_cutoff=snapshot_cutoff,
+            target_bytes=target_bytes,
+        )
+        log.info(
+            "maintenance complete",
+            extra={
+                "table": table,
+                "files_before": before.files,
+                "files_after": after.files,
+                "avg_kib_before": round(before.avg_kib, 1),
+                "avg_kib_after": round(after.avg_kib, 1),
+            },
+        )
+        if before.rows != after.rows:
+            # Maintenance is not allowed to change what the table says. If it does,
+            # something deleted live data and the exit code has to say so.
+            log.error(
+                "maintenance changed the row count",
+                extra={"table": table, **asdict(after)},
+            )
+            print(
+                f"\nFAIL {table}: {before.rows:,} rows before, {after.rows:,} after. "
+                "Maintenance must not change table contents."
+            )
+            return 1
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
     settings = get_settings()
     configure_logging(settings.log_level, as_json=settings.log_json)
     spark = build_session("maintain-tables", settings)
@@ -146,42 +198,17 @@ def main(argv: list[str] | None = None) -> int:
     orphan_cutoff = hours_ago(args.orphan_age_hours)
     snapshot_cutoff = hours_ago(args.snapshot_age_hours)
     try:
-        tables = (
-            settings.bronze_raw_table,
-            settings.silver_edits_table,
-            settings.silver_quarantine_table,
+        return maintain_all(
+            spark,
+            (
+                settings.bronze_raw_table,
+                settings.silver_edits_table,
+                settings.silver_quarantine_table,
+            ),
+            orphan_cutoff=orphan_cutoff,
+            snapshot_cutoff=snapshot_cutoff,
+            target_bytes=args.target_file_size_bytes,
         )
-        for table in tables:
-            before, after = maintain(
-                spark,
-                table,
-                orphan_cutoff=orphan_cutoff,
-                snapshot_cutoff=snapshot_cutoff,
-                target_bytes=args.target_file_size_bytes,
-            )
-            log.info(
-                "maintenance complete",
-                extra={
-                    "table": table,
-                    "files_before": before.files,
-                    "files_after": after.files,
-                    "avg_kib_before": round(before.avg_kib, 1),
-                    "avg_kib_after": round(after.avg_kib, 1),
-                },
-            )
-            if before.rows != after.rows:
-                # Maintenance is not allowed to change what the table says. If it does,
-                # something deleted live data and the exit code has to say so.
-                log.error(
-                    "maintenance changed the row count",
-                    extra={"table": table, **asdict(after)},
-                )
-                print(
-                    f"\nFAIL {table}: {before.rows:,} rows before, {after.rows:,} after. "
-                    "Maintenance must not change table contents."
-                )
-                return 1
-        return 0
     finally:
         spark.stop()
 
