@@ -210,7 +210,7 @@ file:/opt/spark/checkpoints/.../silver_edits/commits. SQLSTATE: XXKST
 No second query exists. The MERGE has already happened, so nothing is lost or
 duplicated — the run exits non-zero and the batch stays unconfirmed.
 
-The hedge in "may" is the honest part, and it was not there first. Four consecutive runs
+The hedge in "may" is the honest part, and it was not there first. Four recorded runs all
 produced that error, so the test asserted it. The fifth, on 2026-09-18, resumed cleanly
 and exited 0 — and the assertion was wrong rather than the pipeline. The difference is
 how many batches the crash left unconfirmed: a SIGKILL landing *inside* a batch writes

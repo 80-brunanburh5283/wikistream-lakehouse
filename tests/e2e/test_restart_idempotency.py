@@ -524,18 +524,17 @@ def test_once_is_not_a_reliable_way_to_resume_an_unconfirmed_batch(crash_and_res
     offsets but no commit it does one of two things, both observed:
 
         exit 1  [STREAM_FAILED] ... Multiple streaming queries are concurrently
-                using .../commits. SQLSTATE: XXKST     (2026-09-17, and the three runs
-                                                        before it: one unconfirmed batch)
-        exit 0  resumes, merges, commits, exits clean   (2026-09-18: two unconfirmed
-                                                        batches, because the SIGKILL
-                                                        landed inside a batch and left
-                                                        an extra `offsets/N`)
+                using .../commits. SQLSTATE: XXKST
+        exit 0  resumes, merges, commits, exits clean
 
     No second query exists in either case. The first version of this test asserted the
-    failure, because that is what every run until 2026-09-18 did; then one resumed
-    cleanly and the assertion was wrong rather than the pipeline. Step [4] now prints the
-    unconfirmed set, so a future run says which shape it had instead of leaving the next
-    reader to guess.
+    failure, because that is what four recorded runs did; then one resumed cleanly and the
+    assertion was wrong rather than the pipeline.
+
+    What differs is how many batches the crash left unconfirmed, and the two runs where
+    that was measured line up: one unconfirmed batch failed, two resumed. The earlier runs
+    predate the measurement, so their shape is not known — which is the reason step [4]
+    now prints the unconfirmed set rather than leaving the next reader to guess.
 
     What is invariant is what an operator actually needs, and it is asserted below and in
     the six tests above: neither outcome loses or duplicates a row, and the continuous

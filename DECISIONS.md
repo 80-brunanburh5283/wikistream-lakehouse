@@ -2686,11 +2686,11 @@ case.
 
 `tests/e2e/test_restart_idempotency.py` carried a seventh test asserting that
 `make stream-silver-once` — `Trigger.AvailableNow` — *cannot* resume a checkpoint whose
-newest batch has offsets but no commit. Four consecutive runs produced the same failure,
-`[XXKST] Multiple streaming queries are concurrently using .../commits`, with no second
-query in existence, so the test asserted exit code non-zero and that error string. It
-guarded a section of `docs/correctness.md` and a line in runbook entry 6 that both tell
-an operator to restart a crashed stream with the continuous trigger.
+newest batch has offsets but no commit. Four runs were recorded and all four produced the
+same failure, `[XXKST] Multiple streaming queries are concurrently using .../commits`,
+with no second query in existence, so the test asserted exit code non-zero and that error
+string. It guarded a section of `docs/correctness.md` and a line in runbook entry 6 that
+both tell an operator to restart a crashed stream with the continuous trigger.
 
 On 2026-09-18 the fifth run exited 0. `--once` resumed the unconfirmed batch, merged it,
 committed, and left 2,497 rows with 2,497 distinct event ids. The pipeline was right and
