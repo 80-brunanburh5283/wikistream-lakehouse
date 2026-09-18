@@ -12,6 +12,14 @@ decisions table to point at an argument. A backfilled record is worth less than 
 contemporaneous one, so they are marked rather than dated as if they were written on
 the day.
 
+Several records quote a percentage of "the job adverts this project was designed
+against". That is one specific dataset, and this is what it is: 31 data-engineering
+adverts collected in September 2026 from four public job boards (arbeitnow,
+himalayas, remoteok, jobicy), counted by whole-word keyword match. It is a small
+sample of a regional slice of the market, so treat every percentage from it as an
+indication of where I chose to spend my time and not as a measurement of the
+industry. The technical arguments in these records stand or fall on their own.
+
 Newest last.
 
 ---

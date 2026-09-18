@@ -674,6 +674,9 @@ undocumented is worse.
 
 ## What I would do differently
 
+Five, and the second is the worst: it is the only one that left a ceiling in the
+running system rather than a lesson in a document.
+
 - **Make the trigger interval a first-class knob with a documented price.** I set
   30 seconds early, and only after measuring discovered that it decides three
   things at once: latency (p99 30.7 s), the file count (3.99 data files per commit,
